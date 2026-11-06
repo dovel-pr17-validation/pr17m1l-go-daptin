@@ -1,0 +1,324 @@
+# Documentation Status
+
+> Historical testing notes below are not current product claims. For current
+> setup and operating guidance, use [[Installation]], [[Database-Setup]], and
+> [[Production-Deployment]].
+
+Track what's documented and what users still need.
+
+**Rule**: Only mark complete after testing the documented workflow yourself.
+
+---
+
+## Before Testing: Fresh Database
+
+**ALWAYS start with a fresh database when testing documentation.**
+
+```bash
+# 1. Stop Daptin (Ctrl+C)
+# 2. Delete the database
+rm daptin.db
+
+# 3. Restart Daptin
+go run ./cmd/daptin
+```
+
+This gives you a clean system where:
+- No admin exists yet (system is wide open)
+- Signup works for guests
+- You can test the full user journey
+
+---
+
+## How to Document Properly
+
+**Every wiki page must be based on actual testing, not assumptions.**
+
+### The Process
+
+1. **Test First, Write Second**
+   - Run the actual commands yourself
+   - Verify the response matches what you document
+   - If something doesn't work, investigate the code - don't guess
+
+2. **Include Real Examples**
+   - Copy actual curl commands you ran
+   - Copy actual responses you received
+   - Include error messages users might encounter
+
+3. **When Stuck, Read the Code**
+   - Don't document features you haven't verified
+   - If the API behaves differently than expected, check the handler
+   - Action names, column names, and endpoints must match the code
+
+4. **Mark Tested Examples**
+   - Add "**Tested ✓**" at the top of pages with verified examples
+   - Include the Daptin version or date of testing
+   - Note any prerequisites (admin access, SMTP config, etc.)
+
+### What Makes Bad Documentation
+
+- Documenting features that don't exist
+- Copying theoretical examples without testing
+- Wrong action names (e.g., `generate_password_reset_otp` vs `generate_password_reset`)
+- Wrong table/column names (e.g., `user_usergroup` vs `user_account_user_account_id_has_usergroup_usergroup_id`)
+- Claiming capabilities the system doesn't have
+- Omitting critical steps (like server restart after schema changes)
+
+### What Makes Good Documentation
+
+- Every example was actually run and verified
+- Error scenarios are documented with real error messages
+- Caching behavior and restart requirements are noted
+- Prerequisites are listed upfront
+- The user can follow step-by-step and succeed
+
+### When Features Don't Work
+
+If you find a feature that doesn't work as expected:
+1. Check if it's a bug or intentional behavior
+2. Document the actual behavior, not the expected behavior
+3. Add a troubleshooting section with workarounds
+4. File an issue if it's a bug
+
+---
+
+## Status
+
+- ✅ Complete - Tested, works as documented
+- 📝 Needs Work - Exists but incomplete or untested
+- ❌ Missing - No documentation
+
+---
+
+## Getting Started
+
+*"How do I start using Daptin?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| Installation | ✅ | Historical setup testing covered source builds, SQLite, MariaDB, PostgreSQL, Docker, and Docker Compose. Use [[Installation]] for current commands and image tags. |
+| First Admin Setup | ✅ | In Getting-Started-Guide.md |
+| Create Your First Table | ✅ | In Getting-Started-Guide.md |
+| CRUD Operations | ✅ | Rewritten, removed false claims (transactions, wrong action names) |
+
+---
+
+## Build Your Data Model
+
+*"How do I define my data?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| Define Tables (Schema) | ✅ | Schema-Definition.md |
+| Column Types | ✅ | Column-Types.md, Column-Type-Reference.md |
+| Link Tables (Relationships) | ✅ | Relationships.md |
+| Filter & Sort Data | ✅ | Filtering-and-Pagination.md - Complete with all operators, sorting, pagination, fuzzy search tested |
+| Aggregate Data | ✅ | Aggregation-API.md - All basic features tested. Known issues: HAVING clause and POST method not working |
+
+---
+
+## Control Access
+
+*"Who can see and edit my data?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| Understanding Permissions | ✅ | Permissions.md |
+| Managing Users | ✅ | Users-and-Groups.md - fixed junction table names, action names |
+| Creating User Groups | ✅ | Users-and-Groups.md |
+| Sharing Records with Groups | ✅ | In Permissions.md |
+| Re-enabling Public Signup | ✅ | In Getting-Started-Guide.md |
+
+---
+
+## User Authentication
+
+*"How do users log in?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| Email/Password Login | ✅ | Authentication.md |
+| JWT Tokens | ✅ | Authentication.md |
+| Two-Factor Auth (2FA) | ✅ | Two-Factor-Auth.md |
+| OAuth (Google, GitHub, etc) | ✅ | Authentication.md |
+| Password Reset | ✅ | Users-and-Groups.md - requires admin access, SMTP |
+
+---
+
+## Add Business Logic
+
+*"How do I add custom behavior?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| What Are Actions? | ✅ | Actions-Overview.md - rewritten for end users |
+| Create Custom Actions | ✅ | Custom-Actions.md - complete performer reference, tested examples |
+| Make HTTP Requests | ✅ | In Custom-Actions.md ($network.request) |
+| Validate Data | ✅ | Validation-Reference.md - COMPLETE 2026-01-27: All 15+ validation tags tested (email, required, min/max, gt/gte/lt/lte, latitude/longitude, iscolor, url, len, oneof, omitempty), real API test results, error message formats, combining tags, complete examples. Also in Custom-Actions.md (Validations section) |
+| Transform Data (Conformations) | ✅ | Conformation-Reference.md - COMPLETE 2026-01-27: All 18 conformation tags documented and tested (trim/ltrim/rtrim, lower/upper/title/ucfirst, camel/snake/slug, name, email, num/!num/alpha/!alpha, !html/!js), verified against conform library source, combining tags, execution order, complete examples with real transformations |
+| State Machines | ✅ | State-Machines.md |
+| Scheduled Tasks | ✅ | Task-Scheduling.md |
+
+---
+
+## Send Email
+
+*"How do I send and receive email?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| Configure SMTP | ✅ | SMTP-Server.md |
+| Send Email from Actions | ✅ | Email-Actions.md - Complete rewrite with tested examples. Bug fixed in mail.send performer (type assertion). Documented performers vs actions, credential storage pattern, working examples for mail.send and aws.mail.send |
+| Receive Email (IMAP) | ✅ | IMAP-Support.md |
+
+---
+
+## Handle Files
+
+*"How do I upload and store files?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| File Columns | ✅ | Asset-Columns.md - inline and cloud storage tested |
+| Cloud Storage (S3, GCS, etc) | ✅ | Cloud-Storage.md - CRUD + file operations working with correct URL format |
+| Serve Static Sites | ✅ | Subsites.md - site creation tested, cache needs restart |
+
+---
+
+## Connect External Services
+
+*"How do I integrate with other APIs?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| Install OpenAPI Integration | ✅ | Integrations.md |
+| Store API Credentials | ✅ | Credentials.md |
+| Import/Export Data | ✅ | Data-Actions.md |
+
+---
+
+## Real-Time Features
+
+*"How do I get live updates?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| WebSocket API | ✅ | Tested 2026-01-26 - All methods working, 69 topics available |
+| YJS Collaboration | ✅ | Tested 2026-01-26 - Both direct and file column endpoints working |
+| GraphQL API | ✅ | Tested 2026-01-26 - Works correctly including subscriptions |
+| FTP Server | ✅ | Tested 2026-01-26 - Site-based access, FTPS/TLS, all operations verified |
+
+---
+
+## Deploy & Operate
+
+*"How do I run Daptin in production?"*
+
+| Guide | Status | Notes |
+|-------|--------|-------|
+| Configuration Options | ✅ | All command-line flags, environment variables, and runtime config tested. MySQL/PostgreSQL noted as requiring external setup |
+| Database Setup | ✅ | MySQL/MariaDB and PostgreSQL tested with Docker. Connection strings verified. Documented in Server-Configuration.md |
+| TLS/HTTPS | ✅ | Tested 2026-01-26 - Complete with self-signed and ACME workflows |
+| Monitoring | ✅ | Tested 2026-01-26 - All endpoints verified, profiling documented |
+
+---
+
+## Coverage Analysis
+
+**See**: [[Feature-Documentation-Coverage|Feature-Documentation-Coverage.md]] for complete analysis
+
+**Overall Documentation Coverage**: 85%
+- Tables: 68% (19/28 tables fully or partially documented)
+- Actions: 98% (46/47 actions documented)
+- Relations: 73% (11/15 relations documented)
+- TableInfo Fields: 86% (18/21 fields documented)
+
+---
+
+## Next Features to Document
+
+Based on systematic analysis of `server/resource/columns.go`:
+
+### Undocumented System Tables (HIGH Priority)
+
+| Table | Purpose | Why Important |
+|-------|---------|---------------|
+| ❌ `document` | File storage with MIME type detection, indexing | User-facing feature for document management beyond simple asset columns |
+| ❌ `mail_server` | SMTP server configuration | SMTP documented as feature but not data model |
+| ❌ `mail_account` | Email account management | IMAP documented but not data structure |
+| ❌ `mail_box` | Mailbox folders (INBOX, Sent, etc.) | Part of IMAP feature, users need table structure |
+| ❌ `mail` | Stored email messages | Core mail storage data model |
+| ❌ `outbox` | Outgoing mail queue | SMTP outbound queue |
+
+### Undocumented TableInfo Fields (MEDIUM Priority)
+
+| Field | Purpose | Impact |
+|-------|---------|--------|
+| ❌ `IsAuditEnabled` | Enable audit logging for table | Security/compliance feature |
+| ❌ `TranslationsEnabled` | Multi-language content support | i18n capability |
+| ❌ `CompositeKeys` | Multi-column unique constraints | Advanced schema definition |
+
+### Partially Documented Features (LOW Priority)
+
+| Feature | Status | Gap |
+|---------|--------|-----|
+| 📝 `template` table | Exists in code | Template system not documented as user feature |
+| 📝 `calendar` table | CalDAV documented | Calendar data model not explained |
+| 📝 `collection` table | Used internally | Generic collection patterns unclear |
+| 📝 `json_schema` table | Developer feature | Schema storage not documented |
+
+---
+
+## Priority
+
+### Must Have (blocks users)
+1. [x] CRUD Operations - rewritten, verified against code
+2. [x] Users & Groups - fixed junction tables, action names, removed fake features
+3. [x] Password Reset - documented in Users-and-Groups.md
+4. [x] File Upload - inline (Asset-Columns) and cloud (Cloud-Storage) tested
+
+### Should Have (common use cases)
+5. [x] Actions Overview - rewritten for end users
+6. [x] Cloud Storage - S3/GCS setup (all actions tested after bug fix)
+7. [x] WebSocket - tested and verified working (2026-01-26)
+8. [x] YJS - tested and verified working (2026-01-26)
+9. [x] Configuration - all flags, env vars, and runtime config tested (2026-01-26)
+
+### Nice to Have (advanced)
+9. [x] GraphQL API - tested 2026-01-26
+10. [x] CalDAV/CardDAV - tested 2026-01-26
+11. [x] FTP Server - tested 2026-01-26
+
+---
+
+## Recently Completed
+
+| What | When | Key Learnings |
+|------|------|---------------|
+| Installation (comprehensive testing and documentation) | 2026-01-27 | Historical observations on container ports, data mounts, database setup, and health checks. Use [[Installation]] and [[Monitoring]] for current commands and endpoints. |
+| Cloud Storage Actions (create_folder, upload_file, move/delete) | 2026-01-27 | **URL Format Critical**: GitHub #166 was about documentation error, not broken code. Actions use `/action/{type}/{action_name}` with `{type}_id` in request attributes. **Async Operations**: create_folder and upload_file execute asynchronously in goroutines. **Bugs Found**: delete_path returns success but doesn't delete; move_path creates directory instead of renaming file. **Testing Confirms Code Works**: All performers execute correctly when called with proper URL format. |
+| CalDAV/CardDAV | 2026-09-21 | Standards-based principal and home-set discovery, separate calendar and address-book resources, REPORT queries, ETags and conditional writes are implemented through Daptin's authenticated resource lifecycle. Data is user-isolated and SQL-backed; local DAV directories are not required. COPY, MOVE, property mutation, scheduling, and sync tokens remain unsupported and are documented explicitly. |
+| FTP Server (site-based file access with FTPS/TLS) | 2026-07-12 | **Conditional Startup**: FTP server starts only when `ftp.enable=true` and at least one site has `ftp_enabled=true`. **Authorization**: Existing site owner, related-usergroup, and administrator permissions control discovery and every file operation. **Containment**: Parent traversal, symlink escape, cross-site rename, and site-root mutation are rejected. **Directory listings**: LIST/NLST return actual authorized entries. **FTPS/TLS**: Automatic using site certificates. **Port**: Default 2121. **Restart Required**: After FTP configuration, site permission, or site-usergroup relationship changes. **Dependencies**: Requires cloud_store → site → ftp_enabled chain. |
+| Monitoring (health checks, statistics, profiling) | 2026-01-26 | **Structure Corrections**: CPU uses `counts` not `count`, process.count is integer not object, disk.io not disk.ioCounters. **HTTP pprof doesn't exist**: Daptin uses file-based profiling via `-runtime=profile` flag, not HTTP endpoints. **Endpoint Clarifications**: /health returns admin HTML UI not simple health check, /meta returns empty body, /api/_config returns HTML not config data. **Statistics are comprehensive**: 8 sections including detailed temperature sensors (29 on macOS M1!), per-core CPU utilization, database connection pool stats, web server metrics. |
+| Email Actions (mail.send, aws.mail.send, custom actions) | 2026-01-26 | **Critical Bug Fixed**: mail.send had hard type assertion causing panic with YAML arrays. Used `GetValueAsArrayString()` helper. **Performers vs Actions**: mail.send/aws.mail.send are NOT direct REST endpoints - must use in custom actions' OutFields. **Credential Pattern**: aws.mail.send uses credential NAME to lookup stored credentials, not inline keys. **No fake features**: mail.send doesn't support contentType, attachments, cc, bcc (docs claimed this). |
+| Aggregation API (count, sum, avg, min, max, GROUP BY, filters, ORDER BY) | 2026-01-26 | All basic aggregations work correctly via GET method. All filter operators tested and working (eq, not, lt, lte, gt, gte, in, notin). GROUP BY and ORDER BY work perfectly. **Known bugs**: HAVING clause generates correct SQL but returns empty results (bug in result processing). POST method fails with "empty identifier" error. Use GET method for all queries. |
+| Server Configuration (env vars, flags, HTTPS, MySQL, PostgreSQL, Olric) | 2026-01-26 | Tested all flags/env vars. MySQL (MariaDB 10.11) and PostgreSQL 15 fully working with 50 concurrent connections. Olric clustering has bug: PubSub topic creation fails with "no available client found". Single-node Olric works. HTTPS requires cert generation + enable_https config. |
+| Documentation Process Meta-Guide | 2026-01-26 | **CRITICAL**: Always check server logs vs client errors; use protocol-appropriate testing tools; search git history for usage examples; read auth middleware for each protocol; don't assume features are broken - verify testing approach first |
+| WebSocket API (tested and verified working, all 6 methods documented) | 2026-01-26 | Use proper clients for protocol, check server logs for actual responses, auth mechanisms vary by protocol, found examples in dadadash repo |
+| YJS Collaboration (tested and verified working, both endpoints documented) | 2026-01-26 | Check dadadash git history for usage examples including commented-out code |
+| GraphQL API (tested from previous session) | 2026-01-26 | Real-time features may use different auth mechanisms |
+| Asset Columns (inline and cloud storage, correct array format) | 2026-01-25 |
+| Server Configuration (config API, port, log_level, runtime, schema folder) | 2026-01-25 |
+| Custom Actions (complete performer reference, 40+ performers, tested examples) | 2026-01-25 |
+| Actions Overview (E2E permission testing, restart requirement documented) | 2026-01-25 |
+| Subsites (site creation, file upload) | 2026-01-24 |
+| Users & Groups (fixed junction tables, removed fake features) | 2026-01-24 |
+| CRUD Operations (removed false claims) | 2026-01-24 |
+| Getting Started (user journeys) | 2026-01-24 |
+| Permissions (admin-first locking) | 2026-01-24 |
+| State Machines | 2026-01-24 |
+| Task Scheduling | 2026-01-24 |
+| Authentication (JWT, OAuth, 2FA) | 2026-01-24 |
+| Email (SMTP/IMAP) | 2026-01-24 |
+| Integrations | 2026-01-24 |

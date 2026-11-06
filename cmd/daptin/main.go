@@ -1,0 +1,773 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"database/sql"
+	"errors"
+	"flag"
+	"fmt"
+	"github.com/buraksezer/olric"
+	olricConfig "github.com/buraksezer/olric/config"
+	"github.com/daptin/daptin/server/auth"
+	daptinid "github.com/daptin/daptin/server/id"
+	"github.com/go-redis/redis/v8"
+	jsoniter "github.com/json-iterator/go"
+	"gopkg.in/natefinch/lumberjack.v2"
+	"io"
+	"net"
+	"net/url"
+	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/GeertJohan/go.rice"
+	"github.com/daptin/daptin/server"
+	"github.com/daptin/daptin/server/resource"
+	"github.com/daptin/daptin/server/statementbuilder"
+	"github.com/gin-gonic/gin"
+	"github.com/gocraft/health"
+	"github.com/jamiealquiza/envy"
+	log "github.com/sirupsen/logrus"
+
+	//"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+)
+
+// Save the stream as a global variable
+var stream = health.NewStream()
+
+var errOlricReadyTimeout = errors.New("olric readiness callback timeout")
+
+func waitForOlricReady(ready <-chan struct{}, startErr <-chan error, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-ready:
+		return nil
+	case err := <-startErr:
+		return err
+	case <-timer.C:
+		return errOlricReadyTimeout
+	}
+}
+
+func init() {
+
+	goMaxProcs, ok := os.LookupEnv("DAPTIN_GOMAXPROCS")
+	if !ok || goMaxProcs == "" {
+		goMaxProcs = "0"
+	}
+	goMaxProcsInt, err := strconv.ParseInt(goMaxProcs, 10, 64)
+	if err != nil {
+		goMaxProcsInt = 0
+	}
+
+	log.SetFormatter(&log.TextFormatter{
+		ForceColors:               true,
+		DisableColors:             false,
+		ForceQuote:                false,
+		DisableQuote:              false,
+		EnvironmentOverrideColors: false,
+		DisableTimestamp:          false,
+		FullTimestamp:             true,
+		TimestampFormat:           "2006-01-02 15:04:05",
+		DisableSorting:            false,
+		SortingFunc:               nil,
+		DisableLevelTruncation:    false,
+		PadLevelText:              false,
+		QuoteEmptyFields:          false,
+		FieldMap:                  nil,
+		CallerPrettyfier:          nil,
+	})
+
+	jsoniter.RegisterTypeEncoder("daptinid.DaptinReferenceId", &daptinid.DaptinReferenceEncoder{})
+
+	log.Debugf("Go Max Procs: %v, Default value was [%v]", goMaxProcsInt, runtime.NumCPU())
+
+	runtime.GOMAXPROCS(int(goMaxProcsInt))
+	// manually set time zone
+	if tz := os.Getenv("TZ"); tz != "" {
+		var err error
+		log.Infof("Setting timezone: %v", tz)
+		time.Local, err = time.LoadLocation(tz)
+		if err != nil {
+			log.Printf("error loading timezone location '%s': %v\n", tz, err)
+		}
+	} else {
+		log.Infof("Setting timezone to UTC since no TZ env variable set")
+	}
+
+	logFileLocation, ok := os.LookupEnv("DAPTIN_LOG_LOCATION")
+	if !ok || logFileLocation == "" {
+		return
+	}
+
+	hostname, _ := os.Hostname()
+	processId := fmt.Sprintf("%v", os.Getpid())
+	logFileLocation = strings.ReplaceAll(logFileLocation, "${HOSTNAME}", hostname)
+	logFileLocation = strings.ReplaceAll(logFileLocation, "${PID}", processId)
+
+	maxLogFileSize, ok := os.LookupEnv("DAPTIN_LOG_MAX_SIZE")
+	if !ok {
+		maxLogFileSize = "10"
+	}
+	maxLogFileBackups, ok := os.LookupEnv("DAPTIN_LOG_MAX_BACKUPS")
+	if !ok {
+		maxLogFileBackups = "10"
+	}
+	maxLogFileAge, ok := os.LookupEnv("DAPTIN_LOG_MAX_AGE")
+	if !ok {
+		maxLogFileAge = "7"
+	}
+
+	maxLogFileSizeInt, err := strconv.ParseInt(maxLogFileSize, 10, strconv.IntSize)
+	if err != nil {
+		log.Fatalf("invalid max log file size: %v => %v", maxLogFileSize, err)
+	}
+	maxLogFileBackupsInt, err := strconv.ParseInt(maxLogFileBackups, 10, strconv.IntSize)
+	if err != nil {
+		log.Fatalf("invalid max log file backups: %v => %v", maxLogFileBackups, err)
+	}
+	maxLogFileAgeInt, err := strconv.ParseInt(maxLogFileAge, 10, strconv.IntSize)
+	if err != nil {
+		log.Fatalf("invalid max log file age: %v => %v", maxLogFileAge, err)
+	}
+
+	lumberjackLogger := &lumberjack.Logger{
+		// Log file absolute path, os agnostic
+		Filename:   filepath.ToSlash(logFileLocation),
+		MaxSize:    int(maxLogFileSizeInt), // MB
+		MaxBackups: int(maxLogFileBackupsInt),
+		MaxAge:     int(maxLogFileAgeInt), // days
+		LocalTime:  true,
+		Compress:   false, // disabled by default
+	}
+
+	mwriter := io.MultiWriter(lumberjackLogger, os.Stdout)
+	log.SetOutput(mwriter)
+	gin.DefaultWriter = mwriter
+	gin.DefaultErrorWriter = mwriter
+}
+
+// Following variables will be statically linked at the time of compiling
+
+// GitCommit holds short commit hash of source tree
+var GitCommit string
+
+// GitBranch holds current branch name the code is built off
+var GitBranch string
+
+// GitState shows whether there are uncommitted changes
+var GitState string
+
+// GitSummary holds output of git describe --tags --dirty --always
+var GitSummary string
+
+// BuildDate holds RFC3339 formatted UTC date (build time)
+var BuildDate string
+
+// Version holds contents of ./VERSION file, if exists, or the value passed via the -version option
+var Version string
+
+func printVersion() {
+	fmt.Printf(`
+   GitCommit: %s
+   GitBranch: %s
+    GitState: %s
+  GitSummary: %s
+   BuildDate: %s
+     Version: %s
+	`, GitCommit, GitBranch, GitState, GitSummary, BuildDate, Version)
+}
+
+func newHTTPServer(addr string, handler http.Handler, tlsConfig *tls.Config, readHeaderTimeout, idleTimeout time.Duration) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+}
+
+func parseHTTPTimeoutSeconds(raw string) (time.Duration, error) {
+	if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+		return 0, err
+	}
+	duration, err := time.ParseDuration(raw + "s")
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("expected a positive number of seconds")
+	}
+	return duration, nil
+}
+
+func main() {
+	//eventEmitter := &emitter.Emitter{}
+
+	var dbType = flag.String("db_type", "sqlite3", "Database to use: sqlite3/mysql/postgres")
+	var localStoragePath = flag.String("local_storage_path", "./storage", "Path where blob column assets will be stored, set to ; to disable")
+	var connectionString = flag.String("db_connection_string", "daptin.db", "\n\tSQLite: test.db\n"+
+		"\tMySql: <username>:<password>@tcp(<hostname>:<port>)/<db_name>\n"+
+		"\tPostgres: host=<hostname> port=<port> user=<username> password=<password> dbname=<db_name> sslmode=enable/disable")
+
+	var webDashboardSource = flag.String("dashboard", "daptinweb", "path to dist folder for daptin web dashboard")
+	//var assetsSource = flag.String("assets", "assets", "path to folder for assets")
+	var port_variable = flag.String("port_variable", "DAPTIN_PORT", "ENV port variable name to look for port")
+	var database_url_variable = flag.String("database_url_variable", "DAPTIN_DB_CONNECTION_STRING", "ENV port variable name to look for connection string")
+	var port = flag.String("port", ":6336", "daptin port")
+	var httpsPort = flag.String("https_port", ":6443", "daptin https port")
+	var runtimeMode = flag.String("runtime", "release", "Runtime for Gin: profile, debug, test, release")
+	var logLevel = flag.String("log_level", "info", "log level : debug, trace, info, warn, error, fatal")
+	var profileDumpPath = flag.String("profile_dump_path", "./", "location for dumping cpu/heap data in profile mode")
+	var profileDumpPeriod = flag.Int("profile_dump_period", 5, "time period in minutes for triggering profile dump")
+	var olricPeers = flag.String("olric_peers", "", "list of olric peers, comma separated in ip:membership_port")
+	var olricPort = flag.Int("olric_port", 0, "base port for olric cache (membership = olric_port+1). Default: auto-derived from HTTP port")
+	var olricBindAddr = flag.String("olric_bind_addr", "", "IP address for embedded Olric and membership listeners. Default: auto-detected interface")
+	var olricSeed = flag.String("olric_seed", "", "hostname to resolve for cluster peer discovery (e.g., daptin-headless.default.svc.cluster.local)")
+	var olricConfigEnv = flag.String("olric_env", "local", "env value for olric: local/lan/wan, default: lan")
+	var shutdownTimeout = flag.Duration("shutdown_timeout", 30*time.Second, "maximum time allowed for graceful shutdown")
+	var shutdownReadinessDelay = flag.Duration("shutdown_readiness_delay", 2*time.Second, "time allowed for readiness changes to reach upstream proxies")
+
+	envy.Parse("DAPTIN") // looks for DAPTIN_PORT, DAPTIN_DASHBOARD, DAPTIN_DB_TYPE, DAPTIN_RUNTIME
+	flag.Parse()
+	if *shutdownTimeout <= 0 || *shutdownReadinessDelay < 0 {
+		log.Fatal("shutdown_timeout must be positive and shutdown_readiness_delay cannot be negative")
+	}
+
+	processCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stopSignals()
+
+	printVersion()
+
+	logLevelParsed, err := log.ParseLevel(*logLevel)
+	if err != nil {
+		log.Errorf("invalid log level: %s, setting to info", *logLevel)
+		logLevelParsed = log.InfoLevel
+	}
+	log.Infof("Runtime is [%s], logLevel: [%s]", *runtimeMode, *logLevel)
+	log.SetLevel(logLevelParsed)
+	profileDumpCount := 0
+	if *runtimeMode == "profile" {
+		gin.SetMode("release")
+		log.Infof("Dumping CPU/Heap Profile at %s every %v Minutes", *profileDumpPath, *profileDumpPeriod)
+
+		hostname, _ := os.Hostname()
+		cpuprofile := fmt.Sprintf("%sdaptin_%s_profile_cpu.%v", *profileDumpPath, hostname, profileDumpCount)
+		heapprofile := fmt.Sprintf("%sdaptin_%s_profile_heap.%v", *profileDumpPath, hostname, profileDumpCount)
+		log.Infof("Dumping CPU/Heap Profile at %s, %s", cpuprofile, heapprofile)
+		cpuFile, err1 := os.Create(cpuprofile)
+		heapFile, err2 := os.Create(heapprofile)
+		if err1 != nil || err2 != nil {
+			log.Errorf("Failed to create file for profile dump: %v - %v", err1, err2)
+		} else {
+			var err error
+			err = pprof.StartCPUProfile(cpuFile)
+			auth.CheckErr(err, "Failed to start CPU profile: %v", err)
+			err = pprof.WriteHeapProfile(heapFile)
+			auth.CheckErr(err, "Failed to start HEAP profile: %v", err)
+		}
+	} else {
+		gin.SetMode(*runtimeMode)
+	}
+
+	stream.AddSink(&health.WriterSink{
+		Writer: os.Stdout,
+	})
+
+	boxRoot1, err := rice.FindBox("../../daptinweb")
+
+	var boxRoot http.FileSystem
+	if err != nil || (webDashboardSource != nil && *webDashboardSource != "daptinweb") {
+		log.Tracef("Dashboard not loading from default path: %v == %v", err, boxRoot1)
+		log.Infof("Try loading web dashboard from: %v", *webDashboardSource)
+		boxRoot = http.Dir(*webDashboardSource)
+	} else {
+		boxRoot = boxRoot1.HTTPBox()
+	}
+
+	if database_url_variable != nil && *database_url_variable != "DAPTIN_DB_CONNECTION_STRING" {
+
+		databaseUrlValue, ok := os.LookupEnv(*database_url_variable)
+		if ok && len(databaseUrlValue) > 0 {
+			if strings.Index(databaseUrlValue, "://") > -1 {
+				log.Printf("connection URL found for database in env variable [%v]", *database_url_variable)
+				databaseUrlParsed, err := url.Parse(databaseUrlValue)
+
+				if err != nil {
+					log.Printf("Unable to parse database variable value as url, passing it as it is")
+					connectionString = &databaseUrlValue
+				} else {
+					password, _ := databaseUrlParsed.User.Password()
+					databaseName := strings.Split(databaseUrlParsed.Path, "/")[1]
+					switch databaseUrlParsed.Scheme {
+					case "postgresql":
+						fallthrough
+					case "postgres":
+						x := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+							databaseUrlParsed.Hostname(), databaseUrlParsed.Port(), databaseUrlParsed.User.Username(), password, databaseName)
+						connectionString = &x
+					case "mysql":
+						x := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s",
+							databaseUrlParsed.User.Username(), password, databaseUrlParsed.Hostname(), databaseUrlParsed.Port(), databaseName)
+						connectionString = &x
+					default:
+						connectionString = &databaseUrlValue
+					}
+				}
+			} else {
+				connectionString = &databaseUrlValue
+			}
+
+			if *dbType == "" {
+				if strings.Index(*connectionString, "dbname=") > -1 {
+					*dbType = "postgres"
+				} else if strings.Index(*connectionString, "@tcp") > -1 {
+					*dbType = "mysql"
+				}
+			}
+		}
+
+	}
+
+	statementbuilder.InitialiseStatementBuilder(*dbType)
+	auth.PrepareAuthQueries()
+	log.Printf("Database connection using: [%v]", *dbType)
+
+	db, err := server.GetDbConnection(*dbType, *connectionString)
+	if err != nil {
+		panic(err)
+	}
+	db.Stats()
+	transaction := db.MustBegin()
+	_ = transaction.Rollback()
+	log.Printf("connection acquired from database [%s]", *dbType)
+
+	portValue := *port
+	portInt := int64(6336)
+	if strings.Index(portValue, ".") > -1 {
+		// port has ip and nothing to do
+		// get the port from the value, ip:port
+		portInt, err = strconv.ParseInt(strings.Split(portValue, ":")[1], 10, 32)
+		if err != nil {
+			portInt = 6336
+		}
+	} else if portValue[0] != ':' {
+		// port is missing :
+		portInt, err = strconv.ParseInt(portValue, 10, 32)
+		portValue = ":" + portValue
+	}
+
+	var olricDb *olric.EmbeddedClient
+
+	if localStoragePath != nil && *localStoragePath != "" {
+		if _, err := os.Stat(*localStoragePath); os.IsNotExist(err) {
+			if mkdirErr := os.MkdirAll(*localStoragePath, 0750); mkdirErr != nil {
+				log.Fatalf("failed to create local storage path %s: %v", *localStoragePath, mkdirErr)
+			}
+		}
+	}
+	olricPortValue := *olricPort
+	if olricPortValue == 0 {
+		if portInt > 2000 {
+			olricPortValue = int(portInt - 1000)
+		} else {
+			olricPortValue = int(portInt + 1000)
+		}
+	}
+	membershipPort := olricPortValue + 1
+
+	olricConfigEnvValue := *olricConfigEnv
+
+	olricConfig1 := olricConfig.New(olricConfigEnvValue)
+	if *olricBindAddr != "" {
+		if net.ParseIP(*olricBindAddr) == nil {
+			log.Fatalf("olric_bind_addr must be an IP address: %q", *olricBindAddr)
+		}
+		olricConfig1.BindAddr = *olricBindAddr
+		olricConfig1.MemberlistConfig.BindAddr = *olricBindAddr
+	}
+	if err := olricConfig1.SetupNetworkConfig(); err != nil {
+		log.Fatalf("failed to configure Olric network: %v", err)
+	}
+
+	olricConfig1.BindPort = olricPortValue
+
+	// MemberlistConfig is already set by olricConfig.New(env) with the correct
+	// local/lan/wan settings. Do NOT overwrite it with memberlist.DefaultLocalConfig().
+
+	olricConfig1.ReplicaCount = 1
+	olricConfig1.WriteQuorum = 1
+	olricConfig1.ReadQuorum = 1
+	olricConfig1.PartitionCount = 23
+
+	olricConfig1.LogLevel = "INFO"
+	olricConfig1.LogVerbosity = 1
+	if len(*olricPeers) > 0 {
+		olricConfig1.Peers = strings.Split(*olricPeers, ",")
+	}
+	olricConfig1.LogOutput = os.Stdout
+
+	olricConfig1.MemberlistConfig.BindPort = membershipPort
+
+	olricReady := make(chan struct{})
+	var olricReadyOnce sync.Once
+	olricConfig1.Started = func() {
+		olricReadyOnce.Do(func() {
+			close(olricReady)
+		})
+	}
+
+	// Compute self address before peer resolution so we can filter it out
+	selfAddr := net.JoinHostPort(olricConfig1.MemberlistConfig.BindAddr, strconv.Itoa(membershipPort))
+
+	// Resolve DNS seed to peer addresses
+	if len(*olricSeed) > 0 {
+		seedPeers := resolveOlricPeers(*olricSeed, membershipPort, selfAddr)
+		olricConfig1.Peers = append(olricConfig1.Peers, seedPeers...)
+	}
+
+	// Filter out self from static peers list
+	var filteredPeers []string
+	for _, peer := range olricConfig1.Peers {
+		if peer != selfAddr {
+			filteredPeers = append(filteredPeers, peer)
+		}
+	}
+	olricConfig1.Peers = filteredPeers
+	log.Infof("Olric: port=%d, membership=%d, env=%s, peers=%v", olricPortValue, membershipPort, olricConfigEnvValue, olricConfig1.Peers)
+
+	emb, err := olric.New(olricConfig1)
+	if err != nil {
+		fmt.Printf("Failed to create olric cache: %v", err)
+	}
+
+	// Start Olric and wait for its readiness callback. Start is a blocking
+	// lifecycle call and should only return on error or shutdown.
+	olricStartErr := make(chan error, 1)
+	go func() {
+		if startErr := emb.Start(); startErr != nil {
+			resource.CheckErr(startErr, "failed to start cache server")
+			olricStartErr <- startErr
+		}
+	}()
+
+	// Keep the previous bounded startup behavior, but use Olric's readiness
+	// signal instead of waiting for Start to return.
+	if startErr := waitForOlricReady(olricReady, olricStartErr, 10*time.Second); startErr == nil {
+		log.Infof("Olric started successfully")
+	} else if errors.Is(startErr, errOlricReadyTimeout) {
+		log.Warnf("Olric readiness callback timeout, proceeding anyway")
+	} else {
+		resource.CheckErr(startErr, "failed to start cache server before readiness")
+	}
+
+	olricDb = emb.NewEmbeddedClient()
+
+	localOlricAddr := olricConfig1.MemberlistConfig.Name
+	log.Infof("PubSub pinned to local Olric: %s", localOlricAddr)
+
+	var membersTopic *olric.PubSub
+	var membersSubscription *redis.PubSub
+	membersTopic, err = olricDb.NewPubSub(olric.ToAddress(localOlricAddr))
+	if err != nil || membersTopic == nil {
+		log.Errorf("failed to create PubSub, skipping member subscription: %v", err)
+	} else {
+		membersSubscription = membersTopic.Subscribe(processCtx, "members")
+		go func(pubsub *redis.PubSub) {
+			channel := pubsub.Channel()
+			for msg := range channel {
+				log.Printf("[402] [%s] Member says: [%v]", msg.Channel, msg.String())
+			}
+		}(membersSubscription)
+
+		_, err = membersTopic.Publish(processCtx, "members",
+			fmt.Sprintf("Joining from %v", olricConfig1.MemberlistConfig.Name))
+		resource.CheckErr(err, "Failed to publish message at _members topic")
+	}
+
+	runtimeInstance, err := server.NewRuntime(processCtx, boxRoot, db, *localStoragePath, olricDb, localOlricAddr)
+	if err != nil {
+		log.Fatalf("failed to initialize server runtime: %v", err)
+	}
+	configStore := runtimeInstance.ConfigStore
+	certManager := runtimeInstance.CertificateManager
+	gate := newReadinessGate(runtimeInstance.Handler, db.PingContext)
+
+	if *runtimeMode == "profile" {
+
+		go func() {
+			ticker := time.NewTicker(time.Duration(*profileDumpPeriod) * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-processCtx.Done():
+					return
+				case <-ticker.C:
+				}
+				profileDumpCount += 1
+				pprof.StopCPUProfile()
+
+				hostname, _ := os.Hostname()
+				cpuprofile := fmt.Sprintf("%sdaptin_%s_profile_cpu.%v", *profileDumpPath, hostname, profileDumpCount)
+				heapprofile := fmt.Sprintf("%sdaptin_%s_profile_heap.%v", *profileDumpPath, hostname, profileDumpCount)
+				log.Infof("Dumping cpu and heap profile at %s, %s", cpuprofile, heapprofile)
+
+				cpuFile, err := os.Create(cpuprofile)
+				heapFile, err := os.Create(heapprofile)
+				if err != nil {
+					log.Errorf("Failed to create file [%v] for profile dump: %v", cpuprofile, err)
+				} else {
+					err = pprof.StartCPUProfile(cpuFile)
+					auth.CheckErr(err, "Failed to start CPU profile: %v", err)
+					err = pprof.WriteHeapProfile(heapFile)
+					auth.CheckErr(err, "Failed to start HEAP profile: %v", err)
+				}
+			}
+
+		}()
+
+	}
+
+	if port_variable != nil && *port_variable != "DAPTIN_PORT" {
+		portVarString := *port_variable
+
+		portVarStringValue, ok := os.LookupEnv(portVarString)
+		log.Infof("Looking up variable [%s] for port: %v", portVarString, portVarStringValue)
+		if ok && len(portVarStringValue) > 0 {
+			if portVarStringValue[0] != ':' {
+				log.Infof("Port value picked from  env is missing colon: %v", portVarStringValue)
+				portVarStringValue = ":" + portVarStringValue
+			}
+			portValue = portVarStringValue
+		}
+	}
+
+	log.Infof("[ProcessId=%v] Listening at port: %v", syscall.Getpid(), portValue)
+
+	transaction, err = db.Beginx()
+	if err != nil {
+		log.Fatalf("failed to begin HTTPS configuration transaction: %v", err)
+	}
+	enableHttps, err := configStore.GetConfigValueFor("enable_https", "backend", transaction)
+	if err != nil {
+		enableHttps = "false"
+		_ = configStore.SetConfigValueFor("enable_https", enableHttps, "backend", transaction)
+	}
+	var readHeaderTimeout, idleTimeout time.Duration
+	for _, setting := range []struct {
+		key            string
+		defaultSeconds int
+		value          *time.Duration
+	}{
+		{"http.read_header_timeout_seconds", 2, &readHeaderTimeout},
+		{"http.idle_timeout_seconds", 30, &idleTimeout},
+	} {
+		raw, configErr := configStore.GetConfigValueFor(setting.key, "backend", transaction)
+		if errors.Is(configErr, sql.ErrNoRows) {
+			raw = strconv.Itoa(setting.defaultSeconds)
+			configErr = configStore.SetConfigValueFor(setting.key, raw, "backend", transaction)
+		}
+		if configErr != nil {
+			_ = transaction.Rollback()
+			log.Fatalf("failed to load %s: %v", setting.key, configErr)
+		}
+		duration, parseErr := parseHTTPTimeoutSeconds(raw)
+		if parseErr != nil {
+			_ = transaction.Rollback()
+			log.Fatalf("invalid %s: %v", setting.key, parseErr)
+		}
+		*setting.value = duration
+	}
+
+	var hostname string
+	var backendHostnameCertificate *resource.TLSCertificate
+	var subsitesCertificateMap map[string]*resource.TLSCertificate
+	if enableHttps == "true" {
+		hostname, err = configStore.GetConfigValueFor("hostname", "backend", transaction)
+		if err != nil {
+			_ = transaction.Rollback()
+			log.Fatalf("failed to load HTTPS hostname: %v", err)
+		}
+		backendHostnameCertificate, err = certManager.GetTLSConfig(hostname, true, transaction)
+		if err != nil {
+			_ = transaction.Rollback()
+			log.Fatalf("failed to load HTTPS certificate for %s: %v", hostname, err)
+		}
+		subsitesCertificateMap, err = certManager.GetTLSForEnabledSubsites(transaction)
+		if err != nil {
+			_ = transaction.Rollback()
+			log.Fatalf("failed to load HTTPS subsite certificates: %v", err)
+		}
+	}
+	if err = transaction.Commit(); err != nil {
+		log.Fatalf("failed to commit HTTPS configuration: %v", err)
+	}
+
+	tracker := server.NewConnectionTracker()
+	plainListener, err := net.Listen("tcp", portValue)
+	if err != nil {
+		log.Fatalf("failed to listen on %s: %v", portValue, err)
+	}
+	plainServer := newHTTPServer(portValue, gate, nil, readHeaderTimeout, idleTimeout)
+	httpServers := []*http.Server{plainServer}
+	serveErrors := make(chan error, 3)
+	go func() {
+		if serveErr := plainServer.Serve(tracker.Wrap(plainListener)); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			serveErrors <- fmt.Errorf("HTTP server: %w", serveErr)
+		}
+	}()
+
+	if enableHttps == "true" {
+		keyPairMap := make(map[string]tls.Certificate)
+		backendCertKeyPair, pairErr := CreateKeyPairFromTLSCertificate(backendHostnameCertificate)
+		if pairErr != nil {
+			log.Fatalf("failed to create backend TLS key pair: %v", pairErr)
+		}
+		keyPairMap[hostname] = backendCertKeyPair
+		for subsiteHostname, subsiteCertificate := range subsitesCertificateMap {
+			certKeyPair, pairErr := CreateKeyPairFromTLSCertificate(subsiteCertificate)
+			if pairErr != nil {
+				log.Fatalf("failed to create TLS key pair for subsite %s: %v", subsiteHostname, pairErr)
+			}
+			keyPairMap[subsiteHostname] = certKeyPair
+		}
+		tlsConfig := &tls.Config{GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert, ok := keyPairMap[info.ServerName]
+			if !ok {
+				return nil, fmt.Errorf("certificate not found for hostname [%v]", info.ServerName)
+			}
+			return &cert, nil
+		}}
+		httpsListener, listenErr := net.Listen("tcp", *httpsPort)
+		if listenErr != nil {
+			log.Fatalf("failed to listen on HTTPS address %s: %v", *httpsPort, listenErr)
+		}
+		tlsServer := newHTTPServer(*httpsPort, gate, tlsConfig, readHeaderTimeout, idleTimeout)
+		httpServers = append(httpServers, tlsServer)
+		go func() {
+			listener := tls.NewListener(tracker.Wrap(httpsListener), tlsConfig)
+			if serveErr := tlsServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				serveErrors <- fmt.Errorf("HTTPS server: %w", serveErr)
+			}
+		}()
+		log.Infof("TLS server listening on port %v", *httpsPort)
+	} else {
+		log.Info("HTTPS is disabled")
+	}
+
+	gate.SetReady(true)
+	log.Infof("Listening at: [%v]", portValue)
+	var lifecycleErr error
+	select {
+	case <-processCtx.Done():
+		log.Infof("Shutdown signal received")
+	case lifecycleErr = <-serveErrors:
+		log.Errorf("Server stopped unexpectedly: %v", lifecycleErr)
+	case lifecycleErr = <-runtimeInstance.Errors():
+		log.Errorf("Runtime service stopped unexpectedly: %v", lifecycleErr)
+	}
+	gate.SetReady(false)
+	stopSignals()
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), *shutdownTimeout)
+	defer cancelShutdown()
+	_ = runtimeInstance.Quiesce() // Drain reports any quiesce error below.
+
+	delay := time.NewTimer(*shutdownReadinessDelay)
+	select {
+	case <-delay.C:
+	case <-shutdownCtx.Done():
+		delay.Stop()
+	}
+
+	serverShutdownErrors := make(chan error, len(httpServers))
+	for _, httpServer := range httpServers {
+		go func(srv *http.Server) { serverShutdownErrors <- srv.Shutdown(shutdownCtx) }(httpServer)
+	}
+	for range httpServers {
+		if shutdownErr := <-serverShutdownErrors; shutdownErr != nil {
+			lifecycleErr = errors.Join(lifecycleErr, shutdownErr)
+		}
+	}
+	if runtimeErr := runtimeInstance.Drain(shutdownCtx); runtimeErr != nil {
+		lifecycleErr = errors.Join(lifecycleErr, runtimeErr)
+	}
+	tracker.CloseAll()
+
+	if membersTopic != nil {
+		_, _ = membersTopic.Publish(shutdownCtx, "members", fmt.Sprintf("I am shutting down: %v", olricConfig1.MemberlistConfig.Name))
+	}
+	if membersSubscription != nil {
+		_ = membersSubscription.Close()
+	}
+	if olricErr := emb.Shutdown(shutdownCtx); olricErr != nil {
+		lifecycleErr = errors.Join(lifecycleErr, olricErr)
+	}
+	if dbErr := db.Close(); dbErr != nil {
+		lifecycleErr = errors.Join(lifecycleErr, dbErr)
+	}
+	if lifecycleErr != nil {
+		log.Errorf("Shutdown failed: %v", lifecycleErr)
+		os.Exit(1)
+	}
+}
+
+// resolveOlricPeers resolves a DNS hostname to olric peer addresses.
+// It retries up to 3 times with 2s delay for environments where DNS
+// propagates slowly (K8s headless services, Docker Compose scaling).
+func resolveOlricPeers(seed string, membershipPort int, selfAddr string) []string {
+	const maxRetries = 3
+	const retryDelay = 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ips, err := net.LookupHost(seed)
+		if err != nil {
+			if attempt < maxRetries {
+				log.Warnf("Failed to resolve olric seed %q (attempt %d/%d): %v, retrying...", seed, attempt, maxRetries, err)
+				time.Sleep(retryDelay)
+				continue
+			}
+			log.Warnf("Failed to resolve olric seed %q after %d attempts: %v", seed, maxRetries, err)
+			return nil
+		}
+
+		var peers []string
+		for _, ip := range ips {
+			addr := net.JoinHostPort(ip, strconv.Itoa(membershipPort))
+			if addr != selfAddr {
+				peers = append(peers, addr)
+			}
+		}
+
+		if len(peers) == 0 && attempt < maxRetries {
+			log.Warnf("Olric seed %q resolved but no peers after self-filter (attempt %d/%d), retrying...", seed, attempt, maxRetries)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		log.Infof("Resolved olric seed %q to peers: %v", seed, peers)
+		return peers
+	}
+	return nil
+}
+
+func CreateKeyPairFromTLSCertificate(backendHostnameCertificate *resource.TLSCertificate) (tls.Certificate, error) {
+	certPem := append(backendHostnameCertificate.CertPEM, '\n')
+	certPem = append(certPem, backendHostnameCertificate.RootCert...)
+	keyPem := backendHostnameCertificate.PrivatePEMDecrypted
+
+	backendCertKeyPair, err := tls.X509KeyPair(certPem, keyPem)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return backendCertKeyPair, nil
+}

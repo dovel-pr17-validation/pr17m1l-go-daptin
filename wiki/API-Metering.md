@@ -1,0 +1,344 @@
+# API Metering
+
+API metering lets Daptin record usage, reserve capacity before work begins,
+enforce durable named-metric limits, and optionally invoke a billing action
+after a request completes.
+
+If you are choosing between public access, anonymous rate limiting, free plans,
+paid plans, team permissions, and service-account workflows, start with
+[[Authorization-Scenarios]]. This page is the detailed metering reference.
+To sell a plan and create membership only after verified provider payment, see
+[[Payments-and-Checkout]].
+
+For maintainer internals, see [[API-Metering-Technical-KT]].
+
+## Resources
+
+| Resource | Purpose |
+|---|---|
+| `api_plan` | A named plan, its JSON `limits`, and its retirement timestamp |
+| `api_member` | A user's active membership and optional billing period |
+| `api_usage` | One held, completed, cancelled, or expired request reservation |
+| `api_quota` | Durable reserved and consumed totals for one metric/window bucket |
+
+Each `api_usage` record identifies the metered operation and account, its
+progress and result, the quantities consumed, and request and response payloads
+in `request_body` and `response_body`. Payload capture retains at most 64 KiB
+of each body. The `request_bytes` and `response_bytes` fields count the full
+operation payload, and `metadata.request_body_truncated` or
+`metadata.response_body_truncated` is true when a captured body was shortened.
+An empty request body is stored as an empty string. For scheduled actions and
+other calls without an HTTP client, Daptin stores the action inputs and
+results. LLM HTTP calls and direct action and batch invocations store their
+invocation data and results.
+
+`request_body_encoding` and `response_body_encoding` are `utf8` for text or
+`base64` when the payload contains non-UTF-8 bytes. Decode base64 values to
+recover the retained bytes. These fields store bodies, not authorization headers
+or the complete HTTP exchange. Access to `api_usage` follows its ordinary
+resource permissions; payloads may contain user-supplied sensitive data.
+
+`api_plan.archived_at` is the canonical retirement state for sales workflows.
+Set it to a timestamp to retire a plan and to `null` to restore it. Archival does
+not delete or disable the plan: existing `api_member`, `api_usage`, and
+`api_quota` rows continue to resolve it, and metering continues to enforce its
+limits. Purchase catalogs select available plans with the ordinary
+`archived_at is empty` resource query, and purchase actions must check the same
+persisted field before starting provider work. Relationships continue to
+protect billing history from hard deletion.
+
+Retire a plan through a normal resource update with ordinary permissions:
+
+```bash
+curl -X PATCH http://localhost:6336/api/api_plan/API_PLAN_REFERENCE_ID \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{"data":{"type":"api_plan","id":"API_PLAN_REFERENCE_ID","attributes":{"archived_at":"2026-09-09T00:00:00Z"}}}'
+```
+
+Restore it through the same path by PATCHing `archived_at` to `null`. No
+membership, usage, or quota row needs to be rewritten.
+
+Every limit has this shape:
+
+```json
+{"metric":"total_tokens","window":"month","maximum":1000000,"mode":"hard"}
+```
+
+- `metric` is a named measure such as `requests`, `bytes`, `total_tokens`,
+  `input_tokens`, `output_tokens`, or `cost_micros`.
+- `window` is `minute`, `hour`, `day`, `month`, or `member_period`.
+- `maximum` is a non-negative integer.
+- `mode` is `hard` or `soft`. Hard limits deny admission; soft limits record
+  usage without denying it.
+
+Metric/window pairs must be unique within a plan. A `member_period` limit
+requires valid `api_member.period_start` and `period_end` values.
+
+## Create a plan and membership
+
+This plan permits 60 requests per minute and one million tokens per member
+billing period:
+
+```bash
+curl -X POST http://localhost:6336/api/api_plan \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{
+    "data": {
+      "type": "api_plan",
+      "attributes": {
+        "name": "Developer",
+        "price_monthly_cents": 0,
+        "limits": "[{\"metric\":\"requests\",\"window\":\"minute\",\"maximum\":60,\"mode\":\"hard\"},{\"metric\":\"total_tokens\",\"window\":\"member_period\",\"maximum\":1000000,\"mode\":\"hard\"}]",
+        "metadata": "{}"
+      }
+    }
+  }'
+```
+
+An `api_member` is owned by the active user that creates it. An administrator
+cannot change row ownership by putting another `user_account_id` in a create
+request. Use a trusted provisioning action: restrict the action to
+administrators, switch to the selected account, and then create the membership.
+
+```yaml
+Actions:
+  - Name: assign_api_plan
+    Label: Assign API plan
+    OnType: world
+    InstanceOptional: true
+    Permission: 0
+    AccessGroups:
+      - Name: administrators
+        Permission: 524288
+    InFields:
+      - Name: user_reference_id
+        ColumnType: label
+      - Name: api_plan_id
+        ColumnType: label
+      - Name: period_start
+        ColumnType: datetime
+      - Name: period_end
+        ColumnType: datetime
+    OutFields:
+      - Type: __as_user
+        Method: SWITCH_USER
+        SkipInResponse: true
+        Attributes:
+          user_reference_id: ~user_reference_id
+      - Type: api_member
+        Method: POST
+        Attributes:
+          status: active
+          api_plan_id: ~api_plan_id
+          period_start: ~period_start
+          period_end: ~period_end
+```
+
+Invoke the administrator-only action through Daptin:
+
+```bash
+curl -X POST http://localhost:6336/action/world/assign_api_plan \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary '{"attributes":{"user_reference_id":"USER_REFERENCE_ID","api_plan_id":"API_PLAN_REFERENCE_ID","period_start":"2026-09-01T00:00:00Z","period_end":"2026-10-01T00:00:00Z"}}'
+```
+
+Because `SWITCH_USER` precedes `POST`, the new membership belongs to the selected
+account. Accepting the account and plan as inputs is safe here only because the
+wrapper action is administrator-only.
+
+Only active memberships are considered. If more than one is active, the newest
+row is selected.
+
+## Enable metering on resources and actions
+
+Set `metering` on the resource definition in your world schema. For example,
+to count operations on an `orders` resource:
+
+```json
+{
+  "TableName": "orders",
+  "metering": {
+    "enabled": true,
+    "cost_expr": "1",
+    "meter_type": "requests"
+  }
+}
+```
+
+Action-specific settings inherit omitted `cost_expr`, `meter_type`, and
+`post_metering_action` fields from the resource. Set `enabled` explicitly in
+an action override:
+
+```json
+{
+  "metering": {
+    "enabled": true,
+    "cost_expr": "1",
+    "meter_type": "requests",
+    "on_actions": {
+      "generate_report": {
+        "enabled": true,
+        "cost_expr": "50",
+        "meter_type": "compute_units"
+      }
+    }
+  }
+}
+```
+
+`cost_expr` is evaluated only when the completed request did not already supply
+the configured metric. It can read `request`, `response`, `metadata`, and
+`user`. The defaults are `cost_expr: "1"` and `meter_type: "requests"`.
+
+### What you can meter
+
+| Operation | Where to enable it | What one usage record represents |
+|---|---|---|
+| Create, read, update, or delete a resource | Set `metering.enabled` on that resource | One resource operation, whether called through REST or GraphQL |
+| Run a named action | Enable metering on the resource the action belongs to, or in its `on_actions` entry | One action run, including a run started by a scheduled task |
+| Invoke an LLM model | The built-in `llm_model` `invoke` setting is enabled | One model invocation, whether started directly, by an action, or by a batch item |
+| Call an installed integration operation directly | Enable its generated action under the `integration` resource's `on_actions` setting | One generated action run |
+
+For GraphQL, each metered resource or action resolver records its own result;
+`response_bytes` describes that result. The combined GraphQL HTTP response is
+not copied into each usage record. When one HTTP request runs several metered
+operations, each usage record keeps its own result rather than a copy of the
+combined HTTP response. A request with one metered REST operation also records
+the HTTP response body and its full byte count.
+
+Installing an integration does not enable metering for its operations. To meter
+one, use the exact generated action name in the `integration` resource's
+`metering.on_actions` setting. For example, to count calls to the
+`github.com/listRepos` operation:
+
+```json
+{
+  "metering": {
+    "on_actions": {
+      "github.com/listRepos": {
+        "enabled": true,
+        "cost_expr": "1",
+        "meter_type": "requests"
+      }
+    }
+  }
+}
+```
+
+The generated integration action's usage record contains the request to Daptin
+and Daptin's action response. It does not separately capture the request sent
+to the external provider or the provider's raw response bytes.
+
+When one action includes an integration call as an outcome, metering that action
+records the outer action once. It does not create a separate usage record for
+the integration call, even if the generated integration action is metered for
+direct calls. When an action invokes an LLM model, the model invocation has its
+own usage record; a metered outer action has a separate record. These records
+represent different operations and can have different owners or limits.
+
+Choose the metering setting for the work you intend to count. Permission to run
+an action does not grant permission to its records, models, or provider
+credentials. Metering that action does not automatically meter every service
+it calls.
+
+An authorized, admitted operation creates a usage row even without an active
+`api_member`; without a membership and plan, no plan limit applies. Anonymous
+calls are attributed to the persisted `guest@cms.go` account for metering. All such
+calls share that account's quota if it has a plan; they are not separately
+metered per visitor. Guest authorization still uses guest permissions.
+
+## LLM metering
+
+`llm_model` has metering enabled for its `invoke` action. HTTP and declarative
+LLM actions use the same admit/complete/cancel lifecycle. Request types are
+operation-derived, for example `llm_chat`, `llm_embeddings`, and
+`llm_text_completion`.
+
+Model entitlement and quantity are independent gates. The active session must
+first pass the `llm_model` execute permission check through Daptin permissions.
+Metering then uses the signed-in account, or the persisted guest account for an
+unauthenticated request, to find an active `api_member` and related `api_plan`.
+Permission to execute a wrapper action does not bypass either gate.
+
+Provider usage is normalized into named measures including:
+
+- `input_tokens`, `output_tokens`, and `total_tokens`;
+- `cache_read_tokens`, `cache_write_tokens`, and `reasoning_tokens`;
+- `cost_micros` calculated from `llm_deployment.pricing`;
+- supplemental measures such as `search_units` or `ocr_pages` when reported.
+
+A provider that omits usage can still produce a completed request record, but
+token-based limits can only consume measures that are reported or safely
+estimated by the gateway.
+
+If no active `api_member` exists, Daptin still records the request but there are
+no plan limits to enforce. Create an active membership to define how much that
+account may consume. Guest requests use the dedicated `guest@cms.go` account
+for usage and quota without becoming authenticated for permission checks. In a
+trusted workflow, `SWITCH_USER` makes the selected account the owner of the LLM
+reservation and usage; any separate wrapper-action metering remains attached to
+the original caller.
+
+## Reservations and quota state
+
+Admission creates an `api_usage` row in `held` state and reserves applicable
+hard-limit measures in `api_quota`. Completion atomically releases reservations,
+increments consumed totals, stores final measures, and marks the usage row
+`completed`. Cancellation and expiry release reservations. Cancellation can
+record the request and any reported measures; expiry records no consumption.
+
+Hard-limit admission failure returns `402 Payment Required`. Deployment RPM,
+TPM, and concurrency protection are separate gateway controls and may return
+`429 Too Many Requests` or a provider-availability error.
+
+Inspect the durable records with:
+
+```bash
+curl http://localhost:6336/api/api_usage \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+curl http://localhost:6336/api/api_quota \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+## Post-metering billing actions
+
+Set `post_metering_action` to `entity:action` in the metering configuration.
+The action receives `api_usage_id`, `api_plan_id`, `api_member_id`, `measures`,
+endpoint metadata, and the user reference. It runs with the internal-metering
+marker so it does not recursively meter itself.
+
+```json
+{
+  "metering": {
+    "enabled": true,
+    "meter_type": "requests",
+    "post_metering_action": "credit_wallet:deduct_credits"
+  }
+}
+```
+
+## Operational checklist
+
+1. Create a plan with unique named metric/window limits.
+2. Create an active membership owned by the intended user.
+3. Enable metering on the resource or action.
+4. For LLM limits, configure deployment pricing and verify provider usage.
+5. Exercise both successful and denied calls.
+6. Inspect held/completed usage rows and reserved/consumed quota values.
+7. Monitor reservation expiry recovery and database availability.
+
+## Troubleshooting
+
+| Problem | Check |
+|---|---|
+| No usage row | Metering configuration, request logs, and the persisted guest account for unauthenticated requests |
+| No quota bucket | Active membership, plan relationship, and matching metric |
+| Limit never denies | Metric spelling, window, `maximum`, and `mode: hard` |
+| LLM token count is absent | Provider response and normalized gateway usage |
+| Cost is zero | `llm_deployment.pricing` keys and fixed-point values |
+| Reservations remain held | Runtime recovery task and database errors |
+| Billing action does not run | `post_metering_action` name and action logs |

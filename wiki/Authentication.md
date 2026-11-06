@@ -1,0 +1,438 @@
+# Authentication
+
+Daptin supports multiple authentication methods: JWT tokens, OAuth providers, and Two-Factor Authentication.
+
+**Related**: [[Permissions|Permissions]] | [[Users-and-Groups|Users and Groups]] | [[Two-Factor-Auth|Two-Factor Auth]] | [[OAuth-Provider|OAuth Provider]]
+
+---
+
+## JWT Authentication
+
+### Sign Up
+
+```bash
+curl -X POST http://localhost:6336/action/user_account/signup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "name": "User Name",
+      "email": "user@example.com",
+      "password": "password123",
+      "passwordConfirm": "password123"
+    }
+  }'
+```
+
+> **Production requirement:** claiming the first administrator transitions
+> bootstrap permissions and closes public signup. Run the rejection check in
+> [[First-Admin-Setup]] before exposing the service. Create later users through
+> an administrator-controlled resource/action or OAuth flow.
+
+### Sign In
+
+```bash
+curl -X POST http://localhost:6336/action/user_account/signin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "email": "user@example.com",
+      "password": "password123"
+    }
+  }'
+```
+
+**Response**: Returns multiple response types including the JWT token:
+```json
+[
+  {
+    "ResponseType": "client.store.set",
+    "Attributes": {
+      "key": "token",
+      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    }
+  },
+  {
+    "ResponseType": "client.cookie.set",
+    "Attributes": {
+      "key": "token",
+      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...; SameSite=Strict"
+    }
+  },
+  {
+    "ResponseType": "client.notify",
+    "Attributes": {"message": "Logged in", "title": "Success", "type": "success"}
+  },
+  {
+    "ResponseType": "client.redirect",
+    "Attributes": {"delay": 2000, "location": "/", "window": "self"}
+  }
+]
+```
+
+### Using JWT Tokens
+
+**Authorization header** (recommended):
+```bash
+curl http://localhost:6336/api/todo \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+**Cookie**:
+```bash
+curl http://localhost:6336/api/todo \
+  --cookie "token=YOUR_JWT_TOKEN"
+```
+
+### Token Structure
+
+```json
+{
+  "email": "user@example.com",
+  "exp": 1729321122,
+  "iat": 1729061922,
+  "iss": "daptin-INSTANCE_ID",
+  "jti": "unique-token-id",
+  "name": "User Name",
+  "nbf": 1729061922,
+  "sub": "user-reference-id"
+}
+```
+
+| Claim | Description |
+|-------|-------------|
+| `email` | User email address |
+| `exp` | Expiration time (Unix timestamp) |
+| `iat` | Issued at time |
+| `iss` | Issuer (Daptin instance ID) |
+| `jti` | Unique token identifier |
+| `name` | User display name |
+| `nbf` | Not valid before time |
+| `sub` | User reference_id (UUID) |
+
+**Default lifetime**: 3 days (72 hours)
+
+### Account Deletion
+
+Deleting an account through Daptin's resource API invalidates its cached
+authentication identity. Subsequent requests with that account's old JWT return
+HTTP 401, including REST, WebSocket upgrades, and Yjs requests. A token for a
+missing account does not recreate the account. OAuth account provisioning remains
+part of the configured OAuth login action.
+
+This rejects subsequent authentication attempts; it does not disconnect sessions
+that were already open when the account was deleted.
+
+### Configure JWT Settings
+
+```bash
+# Set JWT secret (admin only)
+curl -X POST http://localhost:6336/_config/backend/jwt.secret \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '"your-secure-secret-key"'
+
+# Set issuer name
+curl -X POST http://localhost:6336/_config/backend/jwt.token.issuer \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '"my-application"'
+```
+
+---
+
+## OAuth Authentication
+
+Daptin supports OAuth 2.0 for authenticating users via external providers (Google, GitHub, etc.) or for obtaining API tokens for integrations.
+
+This section covers Daptin as an OAuth consumer. If you want Daptin to issue OAuth/OIDC tokens to another application, use [[OAuth-Provider|OAuth Provider]].
+
+For browser login, the OAuth callback must be on the browser-facing OAuth client origin. If users visit an app frontend that proxies to Daptin, set `oauth_connect.redirect_uri` to that frontend callback, for example `https://app.example.com/oauth/response`, and register `https://app.example.com/oauth/response?authenticator=<oauth_connect.name>` with the provider. A callback completed on an admin dashboard or backend-only host cannot log the browser into a different frontend host.
+
+### OAuth Consumer vs OAuth Provider
+
+| Mode | Use this when | Main tables/endpoints |
+|------|---------------|-----------------------|
+| Daptin as OAuth consumer | Users connect Google, GitHub, Asana, or another upstream provider to Daptin | `oauth_connect`, `oauth_token`, `/action/oauth_connect/oauth_login_begin`, `/action/oauth_token/oauth.login.response` |
+| Daptin as OAuth provider | Another application uses Daptin as the identity/token issuer | `oauth_app`, `/oauth/authorize`, `/oauth/token`, JWKS/OIDC endpoints |
+
+API integrations use the OAuth consumer flow: configure a provider in `oauth_connect`, let each user create their own `oauth_token`, then pass that token reference when executing integration operations.
+
+### System Tables
+
+| Table | Purpose |
+|-------|---------|
+| `oauth_connect` | Provider configuration (client_id, secrets, URLs) |
+| `oauth_token` | Stored access/refresh tokens |
+
+**Note**: These tables have `DefaultGroups: adminsGroup` - only administrators can manage OAuth configurations.
+
+### oauth_connect Columns
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` | label | Unique provider name (e.g., "google", "github") |
+| `client_id` | label | OAuth client ID from provider |
+| `client_secret` | encrypted | OAuth client secret (stored encrypted) |
+| `scope` | content | Comma-separated scopes (e.g., "email,profile") |
+| `response_type` | label | OAuth response type (default: "code") |
+| `redirect_uri` | url | Callback URL (default: "/oauth/response") |
+| `auth_url` | url | Provider's authorization endpoint |
+| `token_url` | url | Provider's token endpoint |
+| `profile_url` | url | Provider's user info endpoint |
+| `profile_email_path` | label | JSON path to email in profile response |
+| `allow_login` | truefalse | Enable user authentication via this provider |
+| `access_type_offline` | truefalse | Request refresh tokens/offline access from providers that support it |
+| `pkce_enabled` | truefalse | Use PKCE state and code verifier storage for this provider |
+| `pkce_challenge_method` | label | PKCE challenge method; `S256` is the recommended value |
+
+### Configure OAuth Provider
+
+**Admin required** - Create oauth_connect record:
+
+```bash
+curl -X POST http://localhost:6336/api/oauth_connect \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "oauth_connect",
+      "attributes": {
+        "name": "google",
+        "client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
+        "client_secret": "YOUR_CLIENT_SECRET",
+        "redirect_uri": "https://app.example.com/oauth/response",
+        "auth_url": "https://accounts.google.com/o/oauth2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "profile_url": "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
+        "scope": "email,profile",
+        "allow_login": true,
+        "access_type_offline": true,
+        "pkce_enabled": false,
+        "pkce_challenge_method": "S256"
+      }
+    }
+  }'
+```
+
+### Provider Examples
+
+**Google**:
+```yaml
+name: google
+auth_url: https://accounts.google.com/o/oauth2/auth
+token_url: https://oauth2.googleapis.com/token
+profile_url: https://www.googleapis.com/oauth2/v1/userinfo?alt=json
+scope: email,profile
+```
+
+**GitHub**:
+```yaml
+name: github
+auth_url: https://github.com/login/oauth/authorize
+token_url: https://github.com/login/oauth/access_token
+profile_url: https://api.github.com/user
+scope: user:email
+```
+
+### OAuth Flow
+
+#### Step 1: Begin OAuth (Redirect to Provider)
+
+```bash
+# oauth_login_begin is an instance action on oauth_connect.
+# The selected row supplies $.name as authenticator and $.scope as scope.
+curl -X POST "http://localhost:6336/action/oauth_connect/oauth_login_begin" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {"oauth_connect_id": "OAUTH_CONNECT_REFERENCE_ID"}}'
+```
+
+**Response**: Returns redirect URL and stores state:
+```json
+[
+  {
+    "ResponseType": "client.store.set",
+    "Attributes": {"key": "secret", "value": "123456"}
+  },
+  {
+    "ResponseType": "client.redirect",
+    "Attributes": {
+      "location": "https://accounts.google.com/o/oauth2/auth?client_id=...&state=123456",
+      "window": "self",
+      "delay": 0
+    }
+  }
+]
+```
+
+For non-PKCE connections, the `state` is a 6-digit TOTP code valid for 300 seconds (5 minutes), used to prevent CSRF attacks. When `oauth_connect.pkce_enabled` is true, Daptin creates a random state value and stores the hashed state plus the PKCE verifier in `oauth_state`; the redirect URL includes a PKCE code challenge using `pkce_challenge_method`.
+
+The redirect URL includes `authenticator=<oauth_connect.name>` on the callback URL. `oauth.login.response` uses that authenticator value to load the same provider configuration during token exchange. Register the exact resulting callback with the provider, for example `https://app.example.com/oauth/response?authenticator=google`.
+
+#### Step 2: User Authorization (External)
+
+User is redirected to the OAuth provider, authenticates, and grants permissions.
+
+#### Step 3: Callback Handling
+
+Provider redirects back to the configured browser-facing callback, for example `/oauth/response?code=AUTH_CODE&state=123456&authenticator=google` on the app origin.
+
+This triggers the `oauth.login.response` action:
+
+```bash
+# Called automatically by the OAuth callback
+curl -X POST "http://localhost:6336/action/oauth_token/oauth.login.response" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "code": "AUTHORIZATION_CODE",
+      "state": "123456",
+      "authenticator": "google"
+    }
+  }'
+```
+
+**What happens**:
+1. Validates state (TOTP check for non-PKCE flows, or `oauth_state` lookup for PKCE flows)
+2. Exchanges code for access/refresh tokens
+3. Stores tokens in `oauth_token` table
+4. If `allow_login=true`:
+   - Fetches user profile from provider
+   - Creates or updates user account
+   - Returns JWT token for the user
+
+### OAuth for API Integration (Not Login)
+
+Set `allow_login: false` to use OAuth only for obtaining API tokens (e.g., Google Sheets access):
+
+```bash
+curl -X POST http://localhost:6336/api/oauth_connect \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "oauth_connect",
+      "attributes": {
+        "name": "google_sheets",
+        "client_id": "YOUR_CLIENT_ID",
+        "client_secret": "YOUR_CLIENT_SECRET",
+        "scope": "https://www.googleapis.com/auth/spreadsheets",
+        "allow_login": false
+      }
+    }
+  }'
+```
+
+Tokens are stored in `oauth_token`. For OpenAPI integrations, the integration
+stores provider-level auth wiring in
+`authentication_specification.oauth_connect_id`; each operation supplies an
+`oauth_token_id` owned by the active user. Direct calls use the authenticated
+request user. Trusted backend workflows can select a service account with
+`SWITCH_USER` before the integration outcome. See [[Integrations|Integrations]].
+
+---
+
+## Two-Factor Authentication
+
+See [[Two-Factor-Auth|Two-Factor Auth]] for complete documentation.
+
+### Quick Reference
+
+**Register OTP** (action name is `register_otp`, not `otp_generate`):
+```bash
+curl -X POST "http://localhost:6336/action/user_account/register_otp" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {"user_account_id": "USER_REFERENCE_ID", "mobile_number": "1234567890"}}'
+```
+
+**Note**: Instance actions pass the reference ID as `{typename}_id` in the body, not in the URL path.
+
+**Verify OTP** (authenticated owner, after enrollment):
+```bash
+curl -X POST http://localhost:6336/action/user_account/verify_otp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "email": "user@example.com",
+      "otp": "123456",
+      "mobile_number": ""
+    }
+  }'
+```
+
+**Parameters**:
+- `email` - User's email address (required if not providing mobile_number)
+- `otp` - The 6-digit OTP code
+- `mobile_number` - Optional, can be used instead of email for verification
+
+**Important**: OTP profiles must be enrolled and verified by the authenticated account owner. Codes use a 120-second period with no adjacent-window skew. Verification is protected by atomic Olric counters (five attempts per account and 50 per source per 15 minutes) and successful codes cannot be replayed. See [[Two-Factor-Auth|OTP Authentication and Account Recovery]].
+
+---
+
+## WebSocket Authentication
+
+Pass JWT token as query parameter:
+
+```javascript
+const ws = new WebSocket(`ws://localhost:6336/live?token=${TOKEN}`);
+
+// Subscribe to table changes
+ws.send(JSON.stringify({
+  method: 'subscribe',
+  attributes: { topicName: 'todo' }
+}));
+```
+
+---
+
+## Password Reset
+
+### Request Reset
+
+```bash
+curl -X POST http://localhost:6336/action/user_account/reset-password \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {"email": "user@example.com"}}'
+```
+
+**Requirements**:
+- Mail server must be configured to send the reset email
+- The action requires appropriate permissions (may need authentication depending on table permissions)
+
+### Complete Reset
+
+```bash
+curl -X POST http://localhost:6336/action/user_account/reset-password-verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "email": "user@example.com",
+      "otp": "RESET_OTP_FROM_EMAIL"
+    }
+  }'
+```
+
+**Note**: The OTP is sent via email and must be verified. After successful verification, the user receives a new JWT token and is logged in.
+
+---
+
+## Security Best Practices
+
+1. **Use HTTPS** in production
+2. **Set strong JWT secret** via `/_config/backend/jwt.secret`
+3. **Rotate secrets** periodically
+4. **Enable 2FA** for admin accounts
+5. **Use short token lifetimes** for sensitive applications
+6. **Validate tokens** on every request
+7. **Keep OAuth client_secret secure** - stored encrypted but protect your database
+8. **Use `allow_login: false`** for OAuth connections that should only be used for API access
+
+---
+
+## See Also
+
+- [[Permissions|Permissions]] - Access control system
+- [[Users-and-Groups|Users and Groups]] - User management
+- [[Two-Factor-Auth|Two-Factor Auth]] - Complete 2FA documentation
+- [[Getting-Started-Guide|Getting Started Guide]] - Admin bootstrapping

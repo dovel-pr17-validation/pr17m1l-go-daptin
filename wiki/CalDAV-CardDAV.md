@@ -1,0 +1,884 @@
+# CalDAV and CardDAV
+
+Daptin exposes authenticated CalDAV and CardDAV services backed by normal
+Daptin resources. Both protocols use Daptin resource permissions for shared
+collections and their objects.
+
+- CalDAV stores collections in `collection` and objects in `calendar`.
+- CardDAV stores collections in `address_book` and objects in `contact`.
+- A DAV collection URL identifies its owner, while the authenticated account
+  supplies the permissions for each request. Each object belongs to the
+  account that created it.
+- The SQL database is durable authority. No `./storage/caldav` or
+  `./storage/carddav` directories are required.
+- Writes use the normal resource lifecycle. If an administrator configures a
+  content column as a cloud-storage file column, DAV uses that configured
+  storage through the same resource path.
+
+## Enable DAV
+
+DAV is disabled by default. Set `caldav.enable` as an administrator, then
+restart Daptin:
+
+```bash
+TOKEN="your-admin-token"
+
+curl -X POST "http://localhost:6336/_config/backend/caldav.enable" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: text/plain" \
+  --data 'true'
+```
+
+Both CalDAV and CardDAV endpoints are enabled by this setting. Enabling an
+endpoint does not grant CRUD access to its backing resource tables.
+
+CalDAV does not change the built-in permissions of `collection` or `calendar`.
+A calendar owner is not automatically a Daptin administrator. An administrator,
+or another account with schema-management permission, grants table access and
+chooses row defaults through the normal Daptin schema. For example, this setup
+lets members of `users` create calendars and gives creators control of their
+own rows. An editor who creates an event under this policy retains direct row
+access after their calendar share is removed:
+
+```yaml
+Tables:
+  - TableName: collection
+    DefaultPermission: 16256 # User CRUD and Execute
+    AccessGroups:
+      - Name: users
+        Permission: 2080768 # Group CRUD and Execute
+  - TableName: calendar
+    DefaultPermission: 12160 # User CRUD
+    AccessGroups:
+      - Name: users
+        Permission: 1556480 # Group CRUD
+```
+
+Choose the table group and rights for your installation. Row defaults apply
+to newly created rows; an administrator sets permissions on existing rows
+through the normal resources. See [[Permissions]] for the schema workflow.
+
+## Client endpoints
+
+Configure clients with the service root and the user's normal Daptin
+credentials:
+
+| Protocol | Service URL | Well-known URL |
+|---|---|---|
+| CalDAV | `https://api.example.com/caldav/` | `https://api.example.com/.well-known/caldav` |
+| CardDAV | `https://api.example.com/carddav/` | `https://api.example.com/.well-known/carddav` |
+
+Bearer authentication and HTTP Basic authentication are supported. A client
+does not need to know the user's Daptin reference ID in advance. It obtains the
+principal and home-set URLs through DAV discovery.
+
+The discovery chain is:
+
+```text
+/caldav/
+  -> /caldav/{user-reference-id}/
+  -> /caldav/{user-reference-id}/calendars/
+  -> /caldav/{user-reference-id}/calendars/{calendar}/
+
+/carddav/
+  -> /carddav/{user-reference-id}/
+  -> /carddav/{user-reference-id}/addressbooks/
+  -> /carddav/{user-reference-id}/addressbooks/{address-book}/
+```
+
+These are protocol URLs, not authorization input. Daptin derives the caller
+from the authenticated `SessionUser`. A request to another account's
+collection uses that collection's canonical owner URL and succeeds only when
+the caller has the required collection and object grants. A delegate's own
+home does not gain the owner's collection.
+
+## Verify discovery
+
+Ask the CalDAV root for the authenticated principal:
+
+```bash
+curl -X PROPFIND "http://localhost:6336/caldav/" \
+  -u "user@example.com:password" \
+  -H "Depth: 0" \
+  -H "Content-Type: application/xml" \
+  --data '<?xml version="1.0"?>
+<D:propfind xmlns:D="DAV:">
+  <D:prop><D:current-user-principal/></D:prop>
+</D:propfind>'
+```
+
+The response is HTTP 207 and contains an authenticated principal such as:
+
+```xml
+<D:current-user-principal>
+  <D:href>/caldav/USER_REFERENCE_ID/</D:href>
+</D:current-user-principal>
+```
+
+Ask that principal for its calendar home:
+
+```bash
+curl -X PROPFIND \
+  "http://localhost:6336/caldav/USER_REFERENCE_ID/" \
+  -u "user@example.com:password" \
+  -H "Depth: 0" \
+  -H "Content-Type: application/xml" \
+  --data '<?xml version="1.0"?>
+<D:propfind xmlns:D="DAV:"
+            xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><C:calendar-home-set/></D:prop>
+</D:propfind>'
+```
+
+For CardDAV, use `/carddav/` and request
+`<A:addressbook-home-set/>` in the
+`urn:ietf:params:xml:ns:carddav` namespace.
+
+## Calendar example
+
+The examples below use the home-set URL returned by discovery:
+
+```bash
+CALENDAR_HOME="http://localhost:6336/caldav/USER_REFERENCE_ID/calendars"
+
+curl -X MKCOL "$CALENDAR_HOME/personal/" \
+  -u "user@example.com:password"
+
+# A CalDAV client may use MKCALENDAR to set properties at creation time.
+curl -X MKCALENDAR "$CALENDAR_HOME/planning/" \
+  -u "user@example.com:password" \
+  -H "Content-Type: application/xml" \
+  --data '<C:mkcalendar xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:"><D:set><D:prop><D:displayname>Planning</D:displayname><C:calendar-description>Team plans</C:calendar-description></D:prop></D:set></C:mkcalendar>'
+
+curl -X PUT "$CALENDAR_HOME/personal/event.ics" \
+  -u "user@example.com:password" \
+  -H "Content-Type: text/calendar" \
+  --data-binary $'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Daptin//EN\r\nBEGIN:VEVENT\r\nUID:event-1\r\nDTSTAMP:20260921T120000Z\r\nDTSTART:20260922T120000Z\r\nDTEND:20260922T130000Z\r\nSUMMARY:Team meeting\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n'
+
+curl "$CALENDAR_HOME/personal/event.ics" \
+  -u "user@example.com:password"
+```
+
+Calendar collections support `calendar-query` and `calendar-multiget` REPORT
+requests. A time-range query returns a recurring event when any occurrence
+overlaps the range, including one that began before it. Time-range filters
+also match tasks and journals. Text filters default to `i;ascii-casemap`;
+`i;octet` performs a case-sensitive match. REPORT requests can select
+components and properties within `calendar-data`, including `novalue="yes"`.
+An empty `calendar-data` selection returns the complete object. The ETag
+describes the stored object in either case. Calendar data is parsed and
+validated before it is stored. Recurrence expansion and recurrence-set limiting
+selectors in `calendar-data` produce a `501` property status until those
+transformations are implemented.
+
+## Address-book example
+
+```bash
+ADDRESSBOOK_HOME="http://localhost:6336/carddav/USER_REFERENCE_ID/addressbooks"
+
+curl -X MKCOL "$ADDRESSBOOK_HOME/contacts/" \
+  -u "user@example.com:password"
+
+curl -X PUT "$ADDRESSBOOK_HOME/contacts/person.vcf" \
+  -u "user@example.com:password" \
+  -H "Content-Type: text/vcard" \
+  --data-binary $'BEGIN:VCARD\r\nVERSION:3.0\r\nUID:person-1\r\nFN:Test Person\r\nEMAIL:test@example.com\r\nEND:VCARD\r\n'
+
+curl "$ADDRESSBOOK_HOME/contacts/person.vcf" \
+  -u "user@example.com:password"
+```
+
+Address books support `addressbook-query` and `addressbook-multiget` REPORT
+requests. vCard data is parsed and validated before it is stored.
+
+## Conflict-safe updates
+
+DAV objects return an `ETag`. Use it with `If-Match` when updating an existing
+object:
+
+```bash
+ETAG=$(curl -sSI "$CALENDAR_HOME/personal/event.ics" \
+  -u "user@example.com:password" |
+  awk 'tolower($1) == "etag:" {gsub(/\r/, "", $2); print $2}')
+
+curl -X PUT "$CALENDAR_HOME/personal/event.ics" \
+  -u "user@example.com:password" \
+  -H "Content-Type: text/calendar" \
+  -H "If-Match: $ETAG" \
+  --data-binary @event.ics
+```
+
+A stale or incorrect `If-Match`, or a matching `If-None-Match`, returns HTTP
+412 without overwriting the stored object.
+Use `If-None-Match: *` when creating an object; if another client creates the
+same path first, the request returns HTTP 412.
+
+Conditional object DELETE also checks `If-Match` and `If-None-Match` against
+the current content ETag. A failed condition returns HTTP 412 and leaves the
+object in place.
+
+## Collection metadata
+
+CalDAV `PROPPATCH` updates `DAV:displayname`,
+`CALDAV:calendar-description`, and the Apple `calendar-color` property
+(`http://apple.com/ns/ical/`) on a calendar collection. They use the normal
+`collection` resource update and its table and row permissions. The display
+name is separate from the collection's URL name; removing it restores the URL
+name as the displayed value. Color is stored on `collection` as `#RRGGBB`;
+lowercase hex digits are accepted and stored uppercase. A new calendar, or one
+whose color property is removed, uses `#3B82F6`. Color can also be supplied in
+`MKCALENDAR` and is returned by collection `PROPFIND` to callers who can read
+the collection. A request containing a protected or invalid property changes
+nothing and reports its failure in the DAV 207 response. For example:
+
+```bash
+curl -X PROPPATCH "$CALENDAR_HOME/personal/" \
+  -u "user@example.com:password" \
+  -H "Content-Type: application/xml" \
+  --data '<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:A="http://apple.com/ns/ical/"><D:set><D:prop><D:displayname>Personal</D:displayname><C:calendar-description>My calendar</C:calendar-description><A:calendar-color>#3B82F6</A:calendar-color></D:prop></D:set></D:propertyupdate>'
+```
+
+CardDAV `PROPPATCH` likewise updates `DAV:displayname` and
+`CARDDAV:addressbook-description` through `address_book`. Its display name is
+separate from the URL name, and removal restores the URL name as the display
+fallback. The JSON:API route remains available for both resources. After obtaining a
+calendar's public `reference_id` from `/api/collection`:
+
+```bash
+curl -X PATCH "http://localhost:6336/api/collection/COLLECTION_REFERENCE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data '{"data":{"type":"collection","id":"COLLECTION_REFERENCE_ID","attributes":{"description":"Work calendar","color":"#0EA5E9"}}}'
+```
+
+The caller needs update permission on both the `collection` table and that
+collection row. The schema chosen by the administrator determines whether an
+owner receives it.
+The updated description is returned by DAV `PROPFIND`. CardDAV uses the same
+contract with `address_book` in place of `collection`; its owner does not
+receive update permission by default.
+
+## Share a CalDAV calendar
+
+For anonymous appointment slots and atomic reservations across calendars, see
+[[Booking|Public appointment booking]]. The `bookable` resource and its actions
+use the existing calendar permissions and scheduling connection.
+
+CalDAV evaluates the authenticated account's Daptin permissions on the
+collection and each event at the calendar owner's canonical URL. A collection
+read grant alone does not grant event content. Free/busy uses peek permission
+on the collection and contributing events, without returning event details.
+
+Administrators choose table access, row defaults, and group membership. After
+creating a `usergroup` and adding the delegate through the `user_account`
+relationship, the calendar owner with `Execute`, an administrator, or a member
+with `Execute` on the collection can set that group's access using the
+`collection/share` action. The action uses the existing Daptin group permission
+bits. For example, `32768` is `GroupRead`, `16384` is `GroupPeek`, and `1556480`
+is `GroupCRUD`.
+`GroupExecute` (`524288`) on the collection grants the ability to manage its
+group shares. The configured table and action permissions also apply.
+Granting access also requires `Refer` permission on the target `usergroup`
+table and row; removing an existing grant does not.
+
+```bash
+curl -X POST "http://localhost:6336/action/collection/share" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{"calendar_reference_id":"COLLECTION_REFERENCE_ID","usergroup_id":"GROUP_REFERENCE_ID","permission":32768}}'
+```
+
+To share with one Daptin account, use `collection/share_user` with either its
+exact email address or its public reference ID. A calendar manager needs
+`Refer` access to the target `user_account` table and row, but does not need
+general account `Read` access. The action resolves an email after checking
+management access to the collection. It creates a group for this calendar and
+account, adds the account through the ordinary membership relationship, and
+applies the same collection and event grants. The response includes the
+account's reference ID and the group's reference ID as the share handle.
+
+```bash
+curl -X POST "http://localhost:6336/action/collection/share_user" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{"calendar_reference_id":"COLLECTION_REFERENCE_ID","recipient_email":"person@example.com","permission":32768}}'
+```
+
+Use `user_account_id` instead of `recipient_email` when the reference ID is
+already known; provide exactly one. An unknown exact email or account ID
+returns 404, and an ambiguous email returns 409. Call `share_user` again with
+another permission value to change that account's rights. Send `"permission":0`
+to revoke the share. Repeated calls for the same calendar and account reuse
+its group. The group membership and row links are the access authority;
+administrators can inspect or change them using normal relationship resources.
+If membership changes, `share_user` refuses to alter that group; use its
+returned group reference ID with `collection/share` to revoke the links.
+Changing membership changes who receives the grant.
+
+To decide whether to show sharing controls for a selected calendar, call the
+read-only `collection/share_capabilities` action:
+
+```bash
+curl -X POST "http://localhost:6336/action/collection/share_capabilities" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{"calendar_reference_id":"COLLECTION_REFERENCE_ID"}}'
+```
+
+Its `can_share_group` and `can_share_user` results reflect the caller's
+persisted collection management grant and the two action permissions.
+`can_prepare_sharing` reports permission to run the preparation action.
+`revocable_edit_sharing` reports whether the row default, existing event
+permissions, and private owner group are prepared for creator revocation.
+Other independent group grants still apply.
+`can_create_event` reports whether the caller can create an event through
+CalDAV PUT: the collection must be readable and grant Create and Refer, and
+the calendar table must grant Peek and Create. `can_update_metadata` reports
+whether the collection table and row permit an update and the collection is
+readable. These write flags are independent of sharing rights and describe
+the current permissions, not a promise that an invalid write will succeed.
+HTTP 403 means the caller cannot use this capability query; hide the controls.
+A true sharing result does not bypass the target group or account `Refer`
+check when a share is submitted. Existing events retain their own row
+permissions; use `event_capabilities` for a specific event.
+
+To show the current direct account shares for a calendar, call
+`collection/list_shares` with its public reference ID:
+
+```bash
+curl -X POST "http://localhost:6336/action/collection/list_shares" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{"calendar_reference_id":"COLLECTION_REFERENCE_ID"}}'
+```
+
+The response contains `shares` and `next_cursor`. Each share has
+`user_account_id`, `permission`, `can_free_busy`, `can_read`, and `can_edit`.
+The booleans describe the direct share grant; table and individual event row
+permissions still determine whether a particular operation succeeds. The
+account's `name` and `email` appear for verified direct shares on this managed
+calendar; this does not grant general account read access. Use `next_cursor`
+in the same action's `cursor` input until it is empty.
+The action requires its own Execute permission and the caller's persisted
+management access to the collection. The list omits group shares, revoked
+account shares, and the private owner grant used by `prepare_sharing`.
+
+For an event the caller can read, query its current edit rights with
+`collection/event_capabilities`:
+
+```bash
+curl -X POST "http://localhost:6336/action/collection/event_capabilities" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{"calendar_reference_id":"COLLECTION_REFERENCE_ID","event_reference_id":"EVENT_REFERENCE_ID"}}'
+```
+
+`can_update` and `can_delete` reflect the collection update grant and the
+`calendar` table and event row grants for those operations. They can differ
+between events in one collection. HTTP 403 means the caller cannot query that
+event's edit rights; it does not disclose event details to a free/busy-only
+viewer. These flags describe authorization at query time; a later write still
+checks the current grants and its ETag condition.
+
+The `share` and `share_user` actions set that group's permission on the
+collection and every event currently in it in one transaction. `GroupExecute`
+applies only to the collection; the other group bits apply to its current
+events. CalDAV `PUT`
+also copies the collection's current group links to each new event in the same
+transaction, including events created by a delegate. The signed-in account
+remains the event row's owner. The action replaces any
+existing links for the same group on those rows and leaves other groups' links
+alone. Send `"permission":0` to remove those links; subsequent CalDAV and JSON:API
+requests then use the remaining row permissions. Other grants may still allow
+access.
+
+The administrator chooses the event-row policy independently of sharing:
+
+| Event-row policy | Result after revoking a delegate's share |
+| --- | --- |
+| No owner bits and no separate owner group grant | The delegate loses share-derived access; the calendar owner has no event content grant unless another permission supplies one. |
+| No owner bits with a private owner group granted on the collection | The delegate loses share-derived access; the owner keeps the group's event grant. |
+| `UserCRUD` for the event creator | A delegate who created the event retains direct JSON:API row access when the `calendar` table permits it, even though the revoked collection share no longer permits DAV access. |
+
+These are administrator choices, not a required owner-group setup. A table
+grant is checked in addition to each row grant; denying the `calendar` table
+also denies users who still have valid event-row grants.
+
+A CalDAV client may read `DAV:acl` and send `ACL` to a calendar collection.
+An `ACL` request replaces its editable shares in one transaction through the
+same collection and event relationships as `collection/share`. Account
+principals use `/caldav/{account_reference_id}/`; group principals use
+`/caldav/groups/{group_reference_id}/`. For example, the following grants
+calendar detail read access to one account:
+
+```bash
+curl -X ACL "$CALENDAR_URL" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/xml" \
+  --data '<D:acl xmlns:D="DAV:"><D:ace><D:principal><D:href>/caldav/ACCOUNT_REFERENCE_ID/</D:href></D:principal><D:grant><D:privilege><D:read/></D:privilege></D:grant></D:ace></D:acl>'
+```
+
+Use `DAV:read`, `CALDAV:read-free-busy`, `DAV:write-content`,
+`DAV:write-properties`, `DAV:bind`,
+`DAV:unbind`, and `DAV:write-acl` for the corresponding existing group rights.
+`DAV:read` sets both `GroupRead` and `GroupPeek`, so direct JSON:API row reads
+and DAV reads agree; free/busy alone sets only `GroupPeek`.
+Content and property writes use the same Daptin update grant, so an ACL request
+must include both privileges together. Write grants require read; unbind also
+requires content and property writes. Deny and invert
+ACEs are unsupported. Owner, administrator, and grants that cannot be
+represented by these DAV privileges are protected; `ACL` preserves them.
+An account ACE also requires permission to run `collection/share_user`.
+Table grants remain an additional access check. This scoped collection
+operation does not claim general RFC 3744 ACL conformance.
+Referable account and group principals expose their display names, principal
+URLs, and permitted group membership. Calendar and address-book clients can
+use `acl-principal-prop-set`, `principal-match`, `principal-property-search`,
+`principal-search-property-set`, and `expand-property` reports for principal
+discovery. Search results follow Daptin's account and group reference grants.
+
+## Share a CardDAV address book
+
+CardDAV uses the same group-link authority for `address_book` and `contact`.
+Configure table access for both resources. The named
+`/action/address_book/share` and `/action/address_book/share_user` actions
+accept an `address_book_reference_id`, a group or account reference ID, and
+the existing group `permission` bits. They update the book and all current
+contacts in one transaction. A CardDAV `PUT` copies the book's current group
+grants to a new contact while leaving the signed-in creator as its owner.
+Setting `permission` to zero revokes those links.
+
+For example, after creating a `usergroup` and adding the delegate through the
+normal account relationship, grant that group read access:
+
+```bash
+curl -X POST "http://localhost:6336/action/address_book/share" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"attributes":{"address_book_reference_id":"BOOK_REFERENCE_ID","usergroup_id":"GROUP_REFERENCE_ID","permission":49152}}'
+```
+
+The `permission` value above combines the existing `GroupRead` and `GroupPeek`
+bits, matching `DAV:read`. The caller must
+be allowed to run the action and manage that address book; table grants for
+`address_book` and `contact` still apply to the delegate.
+
+CardDAV clients can use grant-only `ACL` on the owner's address-book URL.
+Account principals use `/carddav/{account_reference_id}/`, and group
+principals use `/carddav/groups/{group_reference_id}/`. The supported
+privileges are `DAV:read`, `DAV:write-content`, `DAV:write-properties`,
+`DAV:bind`, `DAV:unbind`, and `DAV:write-acl`. As with calendars, content and
+property writes share one Daptin update grant and must be requested together.
+Other table or row permissions can still deny a request or allow access after
+a share is revoked. To revoke a delegate's direct JSON:API access to contacts
+they created, configure the `contact` row default without owner read rights.
+
+For revocable editor access across CalDAV and JSON:API, an administrator
+configures the `calendar` row default without creator `User` rights or public
+`Guest` CRUD rights. For example, `DefaultPermission: 16384` adds no creator
+access. Keep table access for the intended users. This is an administrator
+policy choice; other applications can retain creator-owned rows.
+
+After creating a collection and before granting editor access, its owner calls
+`collection/prepare_sharing`:
+
+```bash
+curl -X POST "http://localhost:6336/action/collection/prepare_sharing" \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{"calendar_reference_id":"COLLECTION_REFERENCE_ID"}}'
+```
+
+The action creates or reuses a private one-account owner group through normal
+sharing, grants it access to the collection and current events, and removes
+creator `User` rights from current events in one transaction. It preserves
+event ownership and other group links. CalDAV copies the owner grant to future
+events. The action refuses a row default that would give future creators
+independent access. It can be called again after more events have been added.
+The private owner grant is not a delegate share. `collection/share_user` and
+`collection/share` reject attempts to remove or weaken it while the calendar
+uses this row policy, including calls using the owner account's email,
+reference ID, or the returned owner group ID.
+Check `revocable_edit_sharing` before offering editor shares. Removing an
+editor's share then removes its share-derived access across CalDAV and
+JSON:API. Separate grants to that account continue to apply. Table-level
+denial cannot replace this row policy: it also denies authorized owners and
+delegates at the table boundary.
+
+A `GroupPeek` grant exposes free/busy intervals without event details.
+`GroupRead` permits event details through CalDAV. Grant both `GroupPeek` and
+`GroupRead` when the reader also needs direct JSON:API event access;
+`GroupCRUD` permits edits when the corresponding table permissions allow them.
+Free/busy reports accept a range of at most one year and examine at most 1,000
+event objects in a collection; larger collections receive HTTP 507.
+
+CalDAV-created events inherit collection links; events created or moved through
+the JSON:API resource path follow their configured row defaults and relations.
+`DefaultGroups` can grant the same group rights to all qualifying new rows,
+independent of a particular calendar. The generated `usergroup_id` parent
+relationship uses its configured link default and does not accept a per-link
+permission.
+If an event is later moved to another collection through the resource API, its
+event link remains on that row; revoking the original collection's current
+events will not find it.
+`CLASS:PRIVATE` is iCalendar classification data; it does not change Daptin
+permissions. Configure the event's row grants to keep its details private.
+
+The delegate uses the calendar owner's canonical CalDAV URL. The delegate's
+own `calendar-home-set` continues to describe calendars owned by that
+delegate; it does not list other owners' calendars. To discover accessible
+calendars across owners, including free/busy-only shares, call the read-only
+`collection/discover` action as the signed-in account:
+
+```bash
+curl -X POST "http://localhost:6336/action/collection/discover" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{}}'
+```
+
+The action response's `Attributes` contains `collections` and `next_cursor`.
+A collection entry contains only `collection_id`, canonical `href`,
+`display_name`, `can_read`, and `can_free_busy`. A free/busy-only share has
+`can_read:false` and `can_free_busy:true`; use `free-busy-query` on its `href`
+instead of requesting event content. Its display name is the collection's URL name. A detail-readable
+entry may use the configured display name. `can_read` means the collection row
+permits `Read` and both `collection` and `calendar` tables permit `Peek`, as
+required for calendar object GETs. Event rows still have their own permissions,
+so `can_read` does not
+promise access to every event. When `next_cursor` is nonempty, pass that opaque
+cursor to the action again with `{"attributes":{"cursor":"NEXT_CURSOR"}}`; a page may be empty while its
+cursor still points to more collections. The action checks current membership,
+table access, and collection access on each call, so revoked shares disappear
+from discovery. Invoking the action also requires `Execute` on the `collection`
+table and on the `discover` action; these checks do not grant row access.
+
+Readable shared collections also appear through the normal
+`GET /api/collection` resource, whose full row response requires `Read`.
+Their stored color is available there and through collection `PROPFIND`.
+The peek-only `collection/discover` response does not include color.
+A group with only peek rights can obtain free/busy intervals through
+`free-busy-query` but cannot read event content or list it through
+`/api/calendar`. Sharing with an individual account uses
+`collection/share_user` as described above. Group
+sharing uses `collection/share` and persisted membership relationships. See
+[[Permissions]] and [[Relationships]] for the general resource workflow.
+
+The `name` field is the collection's URL segment. Change `DAV:displayname` to
+rename the displayed calendar or address book; the URL segment and object
+paths stay the same. Renaming the URL segment through DAV is unsupported.
+
+## Attach files to calendar events
+
+An administrator can connect the built-in `calendar.attachments` asset column
+to a Daptin `cloud_store`. Create the store through the normal `cloud_store`
+resource, then configure the calendar column in the schema and restart Daptin:
+
+```yaml
+- TableName: calendar
+  Columns:
+    - Name: attachments
+      ColumnName: attachments
+      DataType: longblob
+      ColumnType: file.*
+      IsNullable: true
+      IsForeignKey: true
+      ForeignKeyData:
+        DataSource: cloud_store
+        Namespace: calendar-files
+        KeyName: events
+```
+
+`Namespace` names the configured store; `KeyName` selects its folder. See
+[[Asset-Columns]] for the storage setup. Without this connection, ordinary
+CalDAV events still work and the server does not advertise managed attachments.
+
+A client first creates an event with CalDAV `PUT`, then sends the file bytes to
+that event URL with `POST ?action=attachment-add`, `Content-Type`, and
+`Content-Disposition: attachment; filename="agenda.pdf"`. `If-Match` may carry
+the event's current ETag. The response supplies `Cal-Managed-ID` and a new
+ETag. The server adds an `ATTACH` property to the event and stores the bytes
+under that event's reference ID in the configured store. `GET` or `HEAD` on
+the `ATTACH` URL downloads the file only for an account allowed to read the
+collection and event. The event's normal edit grants govern uploads, updates,
+and removals.
+
+To replace a file, `POST ?action=attachment-update&managed-id=ID` with the new
+bytes and headers. To remove it, `POST ?action=attachment-remove&managed-id=ID`.
+Both accept `If-Match`; an ordinary event `PUT` that removes its managed
+`ATTACH` also removes the stored file. Event deletion uses normal asset cleanup.
+Event and calendar `MOVE` preserve attachment bytes and update their URLs.
+Copying an event or calendar containing managed attachments returns HTTP 409;
+upload the files to the new event instead. Each file and the total files sent
+with one invitation are limited to 10 MiB. Recurrence-instance attachment
+operations are unsupported, so the home advertises
+`calendar-managed-attachments-no-recurrence` when configured.
+
+When a connected calendar sends an invitation, Daptin includes the file bytes
+as MIME attachments in the email. Invitees outside the Daptin instance can
+open those email attachments without an account; the CalDAV download URL still
+requires Daptin access.
+
+## Send invitations through a mail account
+
+A calendar can use a Daptin `mail_account` for iCalendar email. Create the
+mail account and its `mail_server` as usual, configure a signing certificate
+for its domain, then set the calendar collection's optional
+`scheduling_mail_account_id` relationship. The mail account remains a
+standalone mail resource and may be connected to more than one calendar.
+Its owner need not be the calendar owner. Editing the relationship uses the
+normal collection and mail account relationship permissions.
+
+```bash
+curl -X PATCH \
+  "http://localhost:6336/api/collection/COLLECTION_REFERENCE_ID/relationships/scheduling_mail_account_id" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data '{"data":{"type":"mail_account","id":"MAIL_ACCOUNT_REFERENCE_ID"}}'
+```
+
+On CalDAV event `PUT`, Daptin compares the event with its previous version.
+When `ORGANIZER` is the connected mail account's address, it queues an iMIP
+`REQUEST` for attendees. Removing an attendee or deleting an event queues
+`CANCEL`. When the connected address is an attendee of an event organized
+elsewhere, changing that attendee's `PARTSTAT` to `ACCEPTED`, `DECLINED`, or
+`TENTATIVE` queues `REPLY` to the organizer. Each message retains the event
+UID, sequence, and recurrence ID. A full cancellation carries
+`STATUS:CANCELLED` and the next sequence number. `SCHEDULE-AGENT=CLIENT` or
+`SCHEDULE-AGENT=NONE` on an attendee suppresses server-generated mail for
+that attendee, so a client that sends its own invitations does not also get
+a Daptin-generated copy. Unconnected calendars continue ordinary CalDAV
+operations without sending mail.
+
+Connected scheduling events return a `Schedule-Tag` header on `GET` and `PUT`
+and a `schedule-tag` property in DAV object queries. A client may send
+`If-Schedule-Tag-Match` on `PUT` or `DELETE`. A matching tag preserves other
+attendees' response states when the client's ETag is stale; a stale schedule
+tag fails with HTTP 412. An attendee may change their own response and local
+event presentation, but cannot change organizer-controlled meeting fields.
+Deleting an attendee copy sends a declined reply unless the request includes
+`Schedule-Reply: F`. The normal Daptin table, collection, and event grants
+still govern the write.
+
+`cal_mail` records each inbound or outbound calendar scheduling message and
+links it to the ordinary received `mail` or queued `outbox` record. The event
+write, outbound `cal_mail` record, Sent copy, and `outbox` row commit
+together. An identical event write does not queue another invitation. Mail
+delivery happens later through Daptin's existing outbox worker. An outbound
+`cal_mail` state of `submitted` means mail was queued. The outbox row is
+the delivery authority. A calendar user can call
+`POST /action/collection/scheduling_status` with `collection_id` and
+`message_id` reference IDs to read `sent`, `retry_count`, `next_retry_at`,
+and `last_error` without access to the sender's mailbox. A failed mail setup
+causes the CalDAV write to fail before it commits. The worker retries failures
+before SMTP DATA acceptance. An uncertain result during DATA stops automatic
+retries; inspect the recipient before manually sending again. Successful DATA
+acceptance is not undone by a failed SMTP QUIT. The worker delivers to the
+recipient domain's MX host, or to that domain's address host when it has no MX
+record. If the receiving server offers STARTTLS, its certificate must be
+trusted by the Daptin server; a self-signed certificate needs an installed
+trust root. Outbound delivery uses SMTP port 25.
+
+Incoming iCalendar mail is stored in the ordinary `mail` resource. To process
+new mail automatically, an administrator creates a durable data exchange with
+source `mail` creation, target action `mail.process_itip`, and `as_user_id`
+linked to an administrator account:
+
+```json
+{
+  "name": "process calendar mail",
+  "source_type": "self",
+  "source_attributes": "{\"name\":\"mail\"}",
+  "target_type": "action",
+  "target_attributes": "{\"type\":\"mail\",\"action\":\"process_itip\",\"attributes\":{}}",
+  "attributes": "{\"name\":\"mail\",\"hook\":\"after\",\"methods\":[\"post\"]}",
+  "options": "{}"
+}
+```
+
+Create these as attributes of `POST /api/data_exchange`, set the
+`as_user_id` relationship through JSON:API, then reload the server's exchange
+configuration. The normal exchange execution worker processes queued mail;
+its `exchange_run` rows report retries and failures. The same administrator
+action can process one stored message explicitly:
+
+```bash
+curl -X POST "http://localhost:6336/action/mail/process_itip" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"attributes":{"mail_id":"MAIL_REFERENCE_ID"}}'
+```
+
+The processor uses the existing bounded MIME parser. A `REPLY` must match a
+connected account, a previously queued invitation, its UID, recurrence ID,
+sequence, and attendee address before it changes the event's `PARTSTAT`.
+Reprocessing the same iTIP content, even in another mail row, has no further
+effect. Stale replies do not change the event. Incoming `REQUEST` and
+`CANCEL` messages create, update, or cancel the attendee's event when the
+receiving mail account is connected to one calendar, or when the administrator
+supplies that calendar's `collection_id`. Daptin writes the event as the
+calendar owner through the normal resource path. When an account is connected
+to several calendars and no calendar is selected, the message remains
+`pending` in the recipient's scheduling inbox. A mail account shared by
+different principals still needs an explicit `collection_id` to identify the
+recipient. Ordinary non-calendar mail remains ordinary mail.
+
+For a calendar owner with a connected mail account, a CalDAV `PROPFIND` on
+`/caldav/OWNER_REFERENCE_ID/` returns `calendar-user-address-set`,
+`schedule-inbox-URL`, and `schedule-outbox-URL`. The address is the connected
+mail account's `username`, expressed as a `mailto:` URI. The mailbox may be
+owned by another Daptin account; that does not change the calendar principal.
+One mail account may serve multiple calendars of the same principal. A shared
+sender serving different principals can still send invitations and route
+replies by the matching outbound invitation. Its address cannot identify the
+principal for a new incoming REQUEST or CANCEL; that mail remains in the
+mailbox until an administrator calls `mail.process_itip` with the `mail_id`
+and an explicit `collection_id`, or configures that field in a mailbox-specific
+data exchange action. The action verifies that the selected collection is
+linked to the receiving mail account. The selected owner can then read the
+message in their scheduling inbox. Scheduling discovery remains unavailable
+for an address shared across principals because it does not identify one
+principal. Unconnected principals receive a missing-property response.
+
+When a principal owns exactly one calendar and it has one connected mail
+account, DAV `OPTIONS` advertises `calendar-auto-schedule`. This tells CalDAV
+clients that Daptin sends invitations from event and task writes, so the client need
+not send a second email. Configure the incoming `mail.process_itip` exchange
+above to apply received requests, replies, and cancellations automatically.
+With multiple calendars, an incoming request has no unique destination, so
+the principal-wide automatic scheduling capability is absent; each connected
+calendar can still queue mail through its own account. In Thunderbird, assign
+the corresponding email identity to each subscribed calendar so an attendee
+reply identifies that attendee.
+
+The inbox URL is `/caldav/OWNER_REFERENCE_ID/schedule-inbox/`. After
+`process_itip` succeeds, the owner can list incoming iTIP messages with
+`PROPFIND` or `REPORT` and read each `.ics` message with `GET`. The inbox
+contains the iCalendar part, not the raw mailbox message. Only the principal
+owner can access it. An applied REQUEST appears as an event or task in the
+selected calendar with the attendee awaiting a response. The attendee changes
+its PARTSTAT through CalDAV PUT to queue a REPLY. Incoming replies update the
+organizer's PARTSTAT and SCHEDULE-STATUS; later REQUEST and CANCEL mail updates
+the same object or affected recurring occurrence. A pending message
+without a selected calendar can be processed again with `collection_id`;
+the owner may also handle it manually. DELETE its inbox `.ics` URL after
+handling it; the stored message remains for deduplication.
+
+The outbox URL is `/caldav/OWNER_REFERENCE_ID/schedule-outbox/`. It accepts
+`POST` of a `METHOD:REQUEST` `VFREEBUSY` message when its organizer matches
+the connected address. For a local recipient, the response contains busy
+intervals from calendars for which the requester has peek or read access;
+unavailable or denied recipients receive no calendar data. Invitations and
+replies are queued by CalDAV `VEVENT` or `VTODO` `PUT` and `DELETE`, not outbox
+`POST`. Deleting a connected calendar through CalDAV removes its events and
+queues their cancellations or attendee replies before the calendar disappears.
+The operation fails without deleting anything if the caller cannot read and
+delete every event in that calendar. Deleting an unconnected calendar sends no
+scheduling mail. A client can use `SCHEDULE-FORCE-SEND` on an attendee or
+organizer to request a fresh invitation or reply; Daptin removes that one-shot
+parameter from the stored object and outgoing message. Queued mail sets
+`SCHEDULE-STATUS=1.0` on the stored object. The
+`collection.scheduling_status` action reports the outbox's sent and retry
+state for a message. The five-minute `cal_mail.reconcile_delivery` task follows
+completed outbox attempts: SMTP acceptance changes the stored status to `1.1`,
+and an exhausted delivery failure changes it to `5.1`. Retries remain pending. The
+content ETag changes when this status changes; the Schedule-Tag does not.
+
+The `calendar-auto-schedule` advertisement covers event and task writes and
+incoming mail processing in the connected setup described above. Daptin also
+exposes Schedule-Tag and a free/busy scheduling outbox. RFC 6638 uses outbox
+`POST` for free/busy requests; scheduling messages follow calendar object
+changes. Scheduling inbox and outbox PROPFIND responses expose the supported
+privileges and the current user's rights; sending rights follow the existing
+calendar create and edit grants. Daptin's access decisions remain its table
+and row grants. Calendar collection ACL uses those grants, but there are no
+separate administrator controls for each scheduling privilege and no claim of
+full RFC 3744 ACL conformance.
+
+## Supported behavior
+
+- standards-based current-user-principal and home-set discovery;
+- separate CalDAV calendars and CardDAV address books;
+- `OPTIONS`, `PROPFIND`, `REPORT`, `MKCOL`, `GET`, `HEAD`, `PUT`, and `DELETE`,
+  plus CalDAV `MKCALENDAR`;
+- CalDAV `MKCALENDAR` with optional display name and description, created
+  atomically; unsupported creation properties are rejected;
+- calendar and address-book `PROPPATCH` for display name and description;
+- calendar object `COPY` and `MOVE`, with `Destination` and `Overwrite`
+  conditions, UID conflict checks, and Daptin resource permissions;
+- calendar collection `COPY` with `Depth: 0` or `infinity`, and collection
+  `MOVE` within the same principal; replacing a connected destination queues
+  cancellations for its former events;
+- `DAV:sync-token` discovery and `DAV:sync-collection` REPORT on calendar and
+  address-book collections, including changed and removed objects;
+- calendar-query/calendar-multiget and addressbook-query/addressbook-multiget;
+- calendar free-busy-query REPORT with a bounded time range;
+- stable content ETags and conditional object PUT/DELETE protection;
+- per-row Daptin permissions for CalDAV and CardDAV, including direct access
+  at an owner's URL when collection and object grants permit it;
+- grant-only `ACL` on calendar and address-book collections through existing
+  sharing relationships;
+- durable SQL-backed storage through Daptin resources;
+- optional iCalendar email delivery through a collection's mail account;
+- conditional automatic scheduling discovery for a principal with one connected calendar.
+
+Collection `COPY` creates a new calendar in the active account's home. A
+depth-zero copy includes only its display name and description; an infinite
+copy includes its objects. The copy has its own resource identities and is
+unconnected to mail until an administrator links a mail account. A collection
+`MOVE` preserves the collection, object identities, sharing, and mail
+connection while changing their URLs; it does not send new invitations.
+Overwriting an existing destination replaces its membership rather than
+merging it. Moving an individual object between calendars carries its resource
+identity and uses the destination calendar's group grants. That move does not
+send new invitations because it does not change the meeting itself.
+
+DAV sync tokens are scoped to the authenticated account and collection.
+An empty token returns currently readable objects; subsequent reports return
+objects changed by DAV operations and a `404` entry for objects removed by DAV.
+CalDAV and scheduling changes are recorded in the same transaction as the
+event, so a CalDAV object created and deleted between reports still yields a
+`404`. CardDAV contact PUT and DELETE use the same transaction-backed history,
+including a contact created and deleted between reports. DAV sync tracks
+protocol operations; direct JSON:API resource edits do not create DAV protocol
+history. Responses are limited to
+1,000 changes by default; a `507` entry for the collection and the returned
+token indicate that the client should request the next page. Checkpoints
+expire after 30 days, at which point the client must start with an empty
+token. Changing a collection grant or the account's group membership also
+invalidates an older token; the client must then start with an empty token.
+Calendar and address-book sync have no fixed 10,000-object or
+10,000-change cutoff. Each report reads a bounded batch of objects or DAV
+changes. Collection grants do not propagate to events
+created or moved through JSON:API. Collection `ACL` is scoped as
+described above and does not claim full WebDAV ACL conformance.
+
+## Troubleshooting
+
+### HTTP 401
+
+The credentials are missing or invalid. Use a bearer token or the Daptin
+account's email and password with Basic authentication.
+
+### HTTP 403 on a principal path
+
+For CalDAV, the caller lacks a required grant on the collection or event at
+that owner URL. For CardDAV, the URL belongs to another account. Start
+discovery at `/caldav/` or `/carddav/` for the authenticated account's own
+collections.
+
+### HTTP 404 on a collection or object
+
+Follow the discovered home-set URL and create the collection with `MKCOL`
+before uploading objects.
+
+### HTTP 412 on PUT
+
+The conditional request does not match current state. Fetch the current ETag,
+resolve the conflict, and retry with the new value.
+
+## See also
+
+- [[Authentication|Authentication]]
+- [[Permissions|Permissions]]
+- [[Asset-Columns|Asset Columns]]
+- [[Server-Configuration|Server Configuration]]

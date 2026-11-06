@@ -1,0 +1,314 @@
+package llm
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	daptinid "github.com/daptin/daptin/server/id"
+	"github.com/daptin/daptin/server/resource"
+	gateway "github.com/daptin/llmgateway"
+	"github.com/daptin/llmgateway/contract"
+	"github.com/google/uuid"
+)
+
+func TestDaptinMeteringCapturesHTTPPayloads(t *testing.T) {
+	database, cruds, _, _ := newCatalogTestResources(t)
+	metering := daptinMetering{cruds: cruds, service: resource.NewMeteringService(&cruds)}
+	handler := metering.captureHandler(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if _, err := io.ReadAll(request.Body); err != nil {
+			t.Error(err)
+		}
+		token, err := metering.Admit(request.Context(), contract.Admission{RequestID: "capture-http", Operation: contract.OperationResponses})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := metering.Complete(request.Context(), contract.Completion{Token: token, Status: "completed", HTTPStatus: 200}); err != nil {
+			t.Error(err)
+			return
+		}
+		writer.Write([]byte(`{"answer":"complete"}`))
+		writer.(http.Flusher).Flush()
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"prompt":"all bytes"}`)))
+	transaction, err := database.Beginx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	rows, _, err := cruds["api_usage"].GetRowsByWhereClauseWithTransaction("api_usage", nil, transaction)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("usage rows = %d, %v", len(rows), err)
+	}
+	if resource.StringOrEmpty(rows[0]["request_body"]) != `{"prompt":"all bytes"}` || resource.StringOrEmpty(rows[0]["response_body"]) != `{"answer":"complete"}` {
+		t.Fatalf("HTTP payloads were not recorded: %#v", rows[0])
+	}
+	requestBytes, err := resource.ResourceRowInt64(rows[0]["request_bytes"])
+	if err != nil || requestBytes != int64(len(`{"prompt":"all bytes"}`)) {
+		t.Fatalf("request_bytes = %v, %v", rows[0]["request_bytes"], err)
+	}
+}
+
+func TestDaptinMeteringBoundsHTTPPayloadCapture(t *testing.T) {
+	database, cruds, _, _ := newCatalogTestResources(t)
+	metering := daptinMetering{cruds: cruds, service: resource.NewMeteringService(&cruds)}
+	requestBody := strings.Repeat("r", resource.MeteringPayloadBodyLimit+1024)
+	responseBody := strings.Repeat("s", resource.MeteringPayloadBodyLimit+2048)
+	handler := metering.captureHandler(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if _, err := io.Copy(io.Discard, request.Body); err != nil {
+			t.Error(err)
+		}
+		token, err := metering.Admit(request.Context(), contract.Admission{RequestID: "bounded-http", Operation: contract.OperationResponses})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := metering.Complete(request.Context(), contract.Completion{Token: token, Status: "completed", HTTPStatus: 200}); err != nil {
+			t.Error(err)
+			return
+		}
+		for offset := 0; offset < len(responseBody); offset += 4096 {
+			writer.Write([]byte(responseBody[offset:min(offset+4096, len(responseBody))]))
+		}
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(requestBody)))
+	if response.Body.String() != responseBody {
+		t.Fatal("client response was truncated")
+	}
+	transaction, err := database.Beginx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	rows, _, err := cruds["api_usage"].GetRowsByWhereClauseWithTransaction("api_usage", nil, transaction)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("usage rows = %d, %v", len(rows), err)
+	}
+	usage := rows[0]
+	requestBytes, requestErr := resource.ResourceRowInt64(usage["request_bytes"])
+	responseBytes, responseErr := resource.ResourceRowInt64(usage["response_bytes"])
+	if requestErr != nil || responseErr != nil || requestBytes != int64(len(requestBody)) || responseBytes != int64(len(responseBody)) {
+		t.Fatalf("metered byte counts = %v, %v (%v, %v)", requestBytes, responseBytes, requestErr, responseErr)
+	}
+	if len(resource.StringOrEmpty(usage["request_body"])) != resource.MeteringPayloadBodyLimit ||
+		len(resource.StringOrEmpty(usage["response_body"])) != resource.MeteringPayloadBodyLimit {
+		t.Fatalf("retained body sizes = %d, %d", len(resource.StringOrEmpty(usage["request_body"])), len(resource.StringOrEmpty(usage["response_body"])))
+	}
+	metadata := resource.StringOrEmpty(usage["metadata"])
+	if !strings.Contains(metadata, `"request_body_truncated":true`) || !strings.Contains(metadata, `"response_body_truncated":true`) {
+		t.Fatalf("truncation flags missing: %s", metadata)
+	}
+}
+
+func TestDaptinMeteringRecordsGuestInvocation(t *testing.T) {
+	database, cruds, _, _ := newCatalogTestResources(t)
+	metering := daptinMetering{cruds: cruds, service: resource.NewMeteringService(&cruds)}
+	token, err := metering.Admit(context.Background(), contract.Admission{
+		RequestID: "guest-request", Operation: contract.OperationResponses,
+		EstimatedUsage: contract.Usage{InputTokens: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.Opaque == "" {
+		t.Fatal("guest invocation did not reserve usage")
+	}
+	duplicate, err := metering.Admit(context.Background(), contract.Admission{
+		RequestID: "guest-request", Operation: contract.OperationResponses,
+	})
+	if err != nil || duplicate.Opaque != token.Opaque {
+		t.Fatalf("duplicate guest admission = %q, %v", duplicate.Opaque, err)
+	}
+	if err := metering.Complete(context.Background(), contract.Completion{
+		Token: token, HTTPStatus: 200, Status: "completed",
+		Usage: contract.Usage{InputTokens: 3, OutputTokens: 2, TotalTokens: 5, CostMicros: 7},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := database.Beginx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	rows, _, err := cruds["api_usage"].GetRowsByWhereClauseWithTransaction("api_usage", nil, transaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := cruds["user_account"].GetUserAccountRowByEmailWithTransaction("guest@cms.go", transaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("guest invocation created %d usage rows, want 1", len(rows))
+	}
+	ownerReference := daptinid.InterfaceToDIR(rows[0]["user_account_id"])
+	guestReference := daptinid.InterfaceToDIR(guest["reference_id"])
+	status, err := resource.ResourceRowInt64(rows[0]["status_code"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownerReference != guestReference || rows[0]["endpoint"] != "/v1/responses" || rows[0]["state"] != "completed" || status != 200 {
+		t.Fatalf("guest usage attribution or status is wrong: %#v", rows[0])
+	}
+	var measures map[string]int64
+	if err := json.UnmarshalFromString(resource.StringOrEmpty(rows[0]["measures"]), &measures); err != nil {
+		t.Fatal(err)
+	}
+	if measures["total_tokens"] != 5 || measures["cost_micros"] != 7 {
+		t.Fatalf("guest measures = %#v", measures)
+	}
+}
+
+func TestDaptinMeteringTerminalizesGuestCancellation(t *testing.T) {
+	database, cruds, _, _ := newCatalogTestResources(t)
+	metering := daptinMetering{cruds: cruds, service: resource.NewMeteringService(&cruds)}
+	token, err := metering.Admit(context.Background(), contract.Admission{
+		RequestID: "guest-embedding-cancel", Operation: contract.OperationEmbeddings,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metering.Cancel(context.Background(), contract.Cancellation{Token: token, Reason: "client_cancelled"}); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := database.Beginx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	rows, _, err := cruds["api_usage"].GetRowsByWhereClauseWithTransaction("api_usage", nil, transaction)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("guest cancellation usage rows = %d, %v", len(rows), err)
+	}
+	guest, err := cruds["user_account"].GetUserAccountRowByEmailWithTransaction("guest@cms.go", transaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0]["state"] != "cancelled" || rows[0]["endpoint"] != "/v1/embeddings" ||
+		daptinid.InterfaceToDIR(rows[0]["user_account_id"]) != daptinid.InterfaceToDIR(guest["reference_id"]) {
+		t.Fatalf("guest cancellation was not terminalized against the guest account: %#v", rows[0])
+	}
+}
+
+func TestDaptinMeteringRecordsGuestEmbedding(t *testing.T) {
+	database, cruds, _, _ := newCatalogTestResources(t)
+	metering := daptinMetering{cruds: cruds, service: resource.NewMeteringService(&cruds)}
+	token, err := metering.Admit(context.Background(), contract.Admission{
+		RequestID: "guest-embedding", Operation: contract.OperationEmbeddings,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metering.Complete(context.Background(), contract.Completion{
+		Token: token, HTTPStatus: 200, Status: "completed", Usage: contract.Usage{InputTokens: 2, TotalTokens: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := database.Beginx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	rows, _, err := cruds["api_usage"].GetRowsByWhereClauseWithTransaction("api_usage", nil, transaction)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("guest embedding usage rows = %d, %v", len(rows), err)
+	}
+	var measures map[string]int64
+	if err := json.UnmarshalFromString(resource.StringOrEmpty(rows[0]["measures"]), &measures); err != nil {
+		t.Fatal(err)
+	}
+	if rows[0]["state"] != "completed" || rows[0]["endpoint"] != "/v1/embeddings" || measures["input_tokens"] != 2 {
+		t.Fatalf("guest embedding usage = %#v", rows[0])
+	}
+}
+
+func TestDaptinOlricPortsImplementGatewayContract(t *testing.T) {
+	_, _, embedded, _ := newCatalogTestResources(t)
+	client := newCatalogClusterClient(t, embedded)
+	values, err := client.NewDMap("llmgateway-port-values-" + uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leases, err := client.NewDMap("llmgateway-port-leases-" + uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheValues, err := client.NewDMap("llmgateway-port-cache-" + uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	counters := olricCounterStore{values: values, leases: leases}
+	if value, err := counters.Add(ctx, "rpm", 1, time.Second); err != nil || value != 1 {
+		t.Fatalf("first fixed-window add = %d, %v", value, err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if value, err := counters.Add(ctx, "rpm", 1, time.Second); err != nil || value != 2 {
+		t.Fatalf("second fixed-window add = %d, %v", value, err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if value, found, err := counters.Get(ctx, "rpm"); err != nil || found || value != 0 {
+		t.Fatalf("fixed-window expiry was extended: value=%d found=%v err=%v", value, found, err)
+	}
+
+	lease, err := counters.Acquire(ctx, "deployment", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := counters.Acquire(ctx, "deployment", 1, time.Minute); !errors.Is(err, gateway.ErrCounterLimit) {
+		t.Fatalf("second acquire = %v, want counter limit", err)
+	}
+	if err := counters.Release(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := counters.Release(ctx, lease); err != nil {
+		t.Fatalf("duplicate release must be idempotent: %v", err)
+	}
+	if _, err := counters.Acquire(ctx, "deployment", 1, time.Minute); err != nil {
+		t.Fatalf("released capacity was not reusable: %v", err)
+	}
+
+	first, err := counters.Acquire(ctx, "staggered", 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	second, err := counters.Acquire(ctx, "staggered", 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if _, err := counters.Acquire(ctx, "staggered", 2, time.Second); !errors.Is(err, gateway.ErrCounterLimit) {
+		t.Fatalf("staggered lease counter expired before its newest lease: %v", err)
+	}
+	if err := counters.Release(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := counters.Release(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := olricResponseCache{values: cacheValues}
+	if err := cache.Set(ctx, "response", []byte("payload"), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	payload, found, err := cache.Get(ctx, "response")
+	if err != nil || !found || string(payload) != "payload" {
+		t.Fatalf("cache get = %q, %v, %v", payload, found, err)
+	}
+	if err := cache.Delete(ctx, "response"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := cache.Get(ctx, "response"); err != nil || found {
+		t.Fatalf("cache delete left entry: found=%v err=%v", found, err)
+	}
+}

@@ -1,0 +1,763 @@
+# Actions Overview
+
+Actions are named operations you can invoke via API to perform specific tasks. Unlike CRUD operations (create, read, update, delete) which work on individual records, actions execute business logic - sending emails, uploading files, generating tokens, or calling external APIs.
+
+---
+
+## Quick Start
+
+**Tested ✓** - All examples on this page were verified against a running Daptin instance.
+
+### Call an Action
+
+```bash
+# Entity-level action (no specific record needed)
+curl -X POST http://localhost:6336/action/{entity}/{action_name} \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {...}}'
+
+# Instance action (operates on a specific record)
+curl -X POST http://localhost:6336/action/{entity}/{action_name} \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {"<entity>_id": "RECORD_REFERENCE_ID", ...}}'
+```
+
+### Example: Download System Schema
+
+```bash
+curl -X POST http://localhost:6336/action/world/download_system_schema \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {}}'
+```
+
+Response:
+```json
+[
+  {
+    "ResponseType": "client.file.download",
+    "Attributes": {
+      "content": "base64-encoded-schema-json",
+      "name": "schema.json",
+      "contentType": "application/json"
+    }
+  }
+]
+```
+
+---
+
+## Understanding Response Types
+
+Every action returns an array of responses. Each response has a `ResponseType` that tells clients what to do with the result.
+
+| ResponseType | What It Does |
+|--------------|--------------|
+| `client.notify` | Show a message (success, error, info) |
+| `client.redirect` | Navigate to a URL |
+| `client.file.download` | Download a file (content is base64) |
+| `client.store.set` | Store a value (for frontend localStorage) |
+| `client.cookie.set` | Set a cookie |
+
+### Response Examples
+
+**Notification:**
+```json
+{
+  "ResponseType": "client.notify",
+  "Attributes": {
+    "type": "success",
+    "title": "Success",
+    "message": "Operation completed"
+  }
+}
+```
+
+**File Download:**
+```json
+{
+  "ResponseType": "client.file.download",
+  "Attributes": {
+    "content": "SGVsbG8gV29ybGQ=",
+    "name": "data.txt",
+    "contentType": "text/plain"
+  }
+}
+```
+
+**Redirect:**
+```json
+{
+  "ResponseType": "client.redirect",
+  "Attributes": {
+    "location": "/dashboard",
+    "delay": 2000
+  }
+}
+```
+
+### Success Semantics
+
+HTTP 200 means Daptin accepted the request and the action dispatcher did not
+return a transport-level error. It does not always mean the business operation
+you expected happened.
+
+Actions return an array of response directives. An empty array (`[]`) can mean
+that no `OutFields` produced a response, for example because every outcome was
+conditional and no condition matched. Clients and scripts should check for the
+expected response payload, not only the HTTP status or command exit code.
+
+For example, a custom action that should notify the browser should be checked
+for the expected `client.notify` response:
+
+```bash
+curl -s -X POST http://localhost:6336/action/world/send_notification \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{"recipient":"user@example.com","subject":"Welcome","message":"Hello"}}' |
+  jq -e '.[] | select(.ResponseType == "client.notify" and .Attributes.type == "success")'
+```
+
+If the result is `[]`, debug the action's `OutFields`, `Condition` expressions,
+and performer logs before treating the call as successful.
+
+---
+
+## Built-in Actions by Category
+
+Daptin includes 40+ built-in actions. Here are the most commonly used ones grouped by purpose.
+
+### Authentication & Users
+
+| Action | Entity | Description | Instance Required |
+|--------|--------|-------------|-------------------|
+| `signup` | user_account | Register new user | No |
+| `signin` | user_account | Get JWT token | No |
+| `reset-password` | user_account | Request password reset email | No |
+| `reset-password-verify` | user_account | Complete password reset | No |
+| `otp_generate` | user_account | Enable 2FA | Yes |
+| `otp_login_verify` | user_account | Verify 2FA code | No |
+
+**Example: Sign In**
+```bash
+curl -X POST http://localhost:6336/action/user_account/signin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "email": "admin@admin.com",
+      "password": "adminadmin"
+    }
+  }'
+```
+
+### OAuth Integration
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `oauth_login_begin` | oauth_connect | Start OAuth flow (returns redirect URL) |
+| `oauth.login.response` | oauth_token | Handle OAuth callback |
+
+See [[Authentication|Authentication]] for OAuth setup.
+
+### Administration
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `become_an_administrator` | world | First user claims admin role |
+| `download_system_schema` | world | Export full schema as JSON |
+| `upload_csv_to_system_schema` | world | Create/update tables from CSV |
+
+Runtime configuration uses the administrator-only `/_config` API. Process
+restarts are owned by the process supervisor; neither operation is exposed as
+a world action.
+
+**Example: Export Schema**
+```bash
+curl -X POST http://localhost:6336/action/world/download_system_schema \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {}}'
+```
+
+### Data Import/Export
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `__data_import` | any table | Import JSON/CSV/XLSX data |
+| `__data_export` | any table | Export table data |
+| `__csv_data_export` | any table | Export as CSV file |
+
+**Example: Export Data as CSV**
+```bash
+curl -X POST http://localhost:6336/action/user_account/__csv_data_export \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {}}'
+```
+
+### Cloud Storage
+
+All cloud storage actions require `cloud_store_id` in attributes.
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `upload_file` | cloud_store | Upload files (base64) |
+| `create_folder` | cloud_store | Create directory |
+| `delete_path` | cloud_store | Delete file or folder |
+| `move_path` | cloud_store | Move/rename file or folder |
+| `create_site` | cloud_store | Create a subsite |
+| `list_files` | site | List site files |
+| `get_file` | site | Get file content |
+
+See [[Cloud-Storage|Cloud Storage]] for full examples.
+
+### Email
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `mail.send` | mail_server | Send email via SMTP |
+| `mail.unpack` | mail | Decode an authorized mail action subject for later outcomes |
+| `aws.mail.send` | mail_server | Send via AWS SES |
+
+See [[Email-Actions|Email-Actions]] for setup.
+
+### TLS Certificates
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `generate_self_certificate` | certificate | Generate self-signed certificate |
+| `generate_acme_certificate` | certificate | Get a Let's Encrypt production certificate |
+| `download_certificate` | certificate | Download certificate files |
+
+### Data Exchange
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `add_exchange` | world | Create data sync job |
+| `process_data_exchange_executions` | exchange_run | Process one due durable retry (administrator only) |
+
+See [[Data-Exchange|Data-Exchange]] for details.
+
+### Integrations
+
+| Action | Entity | Description |
+|--------|--------|-------------|
+| `integration_install` | integration | Install OpenAPI integration |
+| `integration_execute` | integration | Execute integration action |
+
+Integration operations use the active action user for credential and OAuth token
+ownership. A generated action uses the authenticated caller. A trusted custom
+action can run `Type: __as_user`, `Method: SWITCH_USER` before an integration
+outcome to use a dedicated service account and that account's credential. See
+[[Integrations|Integrations]] for setup and the complete service-account recipe.
+For the complete prepare, provider-call, verification, and membership lifecycle,
+see [[Payments-and-Checkout]].
+
+LLM outcomes use the active action context in the same way as other outcomes.
+Once Daptin authorizes a server-defined action, its LLM outcomes retain that
+trusted context. After `SWITCH_USER`, the selected account becomes the active
+account for subsequent outcomes and LLM metering.
+
+---
+
+## List Available Actions
+
+Query the `action` table to see all registered actions.
+
+```bash
+# List all actions
+curl http://localhost:6336/api/action \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Response includes:
+- `action_name` - API name to call
+- `label` - Human-readable name
+- `instance_optional` - 1 = no record needed, 0 = requires record ID
+- `world_id` - Which entity this action belongs to
+
+---
+
+## Instance vs Entity Actions
+
+**Entity Actions** (instance_optional=1):
+- Called on the entity itself
+- No specific record needed
+- Example: `POST /action/user_account/signup`
+
+**Instance Actions** (instance_optional=0):
+- Called on a specific record
+- Require the record reference ID in `attributes.{entity}_id`
+- Example: `POST /action/oauth_token/get_token` with `attributes.oauth_token_id`
+
+### Subject Row Authorization
+
+For instance actions, Daptin loads the target row as the action subject before
+running `OutFields`. The caller must be allowed to load and execute that row.
+If user B calls an action on user A's private row, Daptin fails before the
+action outcomes run.
+
+That means action JavaScript usually does not need to repeat the basic owner
+check for the subject row. Add custom ownership or membership checks inside the
+action only when there is an extra business rule beyond the normal Daptin object
+permission model.
+
+Test instance actions across contexts:
+
+| Caller | Subject row | Expected |
+|--------|-------------|----------|
+| Owner | Own row | Action runs if table and action gates also allow it |
+| Normal user B | User A's private row | Forbidden before outfields execute |
+| Guest | Private row | Forbidden |
+| Admin | Any row | Allowed by administrator bypass |
+
+---
+
+## Defining Custom Actions
+
+You can define your own actions in your schema YAML file.
+
+### Basic Action
+
+```yaml
+Tables:
+  - TableName: order
+    Columns:
+      - Name: status
+        DataType: varchar(100)
+
+    Actions:
+      - Name: mark_shipped
+        Label: Mark as Shipped
+        OnType: order
+        InstanceOptional: false
+        InFields:
+          - Name: tracking_number
+            ColumnType: label
+            IsNullable: false
+        OutFields:
+          - Type: client.notify
+            Attributes:
+              type: success
+              message: Order marked as shipped
+        Conformations:
+          - Name: status
+            Value: "shipped"
+```
+
+### Constrained Record Edits
+
+Use a named action when callers should change selected fields without receiving
+direct resource Update access. The full permission contract is described in
+[[Permissions#update-access-includes-permission-changes|Update Access Includes Permission Changes]].
+
+For an existing `todo` table with a `title` column, this top-level schema action
+maps only a validated title into the update. Provision the `editors` usergroup
+and assign its intended members through normal usergroup relationships.
+
+```yaml
+Actions:
+  - Name: edit_title
+    Label: Edit title
+    OnType: todo
+    InstanceOptional: false
+    Permission: 0
+    AccessGroups:
+      - Name: editors
+        Permission: 524288 # GroupExecute
+    InFields:
+      - Name: title
+        ColumnName: title
+        ColumnType: label
+        IsNullable: false
+    Validations:
+      - ColumnName: title
+        Tags: required,max=200
+    OutFields:
+      - Type: todo
+        Method: PATCH
+        Attributes:
+          reference_id: "~todo_id"
+          title: "~title"
+```
+
+Give the intended callers Read and Execute access at the `todo` table and
+subject-row boundaries, and Execute access to this action through its related
+`editors` group. Withhold direct Update access at the table or row boundary;
+check all applicable owner, group, and guest grants. The instance action loads
+and authorizes `todo_id` as its subject before running the outcome. The update
+targets that subject and maps only `title`; it does not forward caller-supplied
+`permission`, ownership, or arbitrary attribute maps.
+
+Call `POST /action/todo/edit_title` with
+`{"attributes":{"todo_id":"RECORD_REFERENCE_ID","title":"Revised title"}}`.
+Verify with a normal editor account that the action changes the title, direct
+PATCH is denied, an extra `permission` input does not change the row's ACL, and
+an unreadable or non-executable subject is rejected. Administrator requests
+alone cannot verify these restrictions.
+
+### Action Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `Name` | string | Unique identifier (used in API) |
+| `Label` | string | Display name in UI |
+| `OnType` | string | Entity this action belongs to |
+| `InstanceOptional` | bool | `true` = no record needed |
+| `InFields` | array | Input parameters user provides |
+| `OutFields` | array | Responses to return |
+| `Conformations` | array | Auto-set field values |
+| `Validations` | array | Input validation rules |
+
+### Input Field Types
+
+```yaml
+InFields:
+  - Name: title
+    ColumnType: label
+    IsNullable: false
+
+  - Name: priority
+    ColumnType: label
+    DataType: enum('low','medium','high')
+
+  - Name: attachment
+    ColumnType: file.pdf|doc|docx
+
+  - Name: due_date
+    ColumnType: datetime
+```
+
+### Auto-Set Values (Conformations)
+
+```yaml
+Conformations:
+  - Name: status
+    Value: "completed"
+
+  - Name: completed_at
+    Value: "~now"       # Current timestamp
+
+  - Name: completed_by
+    AttributeName: user_id  # Current user
+```
+
+---
+
+## Calling Actions Programmatically
+
+State the endpoint and auth context in examples and test notes. These prove
+different things:
+
+| Context | What it proves |
+|---------|----------------|
+| Guest | Public unauthenticated path works |
+| Normal user A | Owner or signed-in user path works |
+| Normal user B | Cross-user isolation works |
+| Admin/operator | Schema, data, or operator path works, but not normal browser authorization |
+
+When using `daptin-cli`, select or state the context explicitly before showing
+evidence:
+
+```bash
+daptin-cli context use local-user-a
+daptin-cli action execute todo mark_done --todo_id "$TODO_A_ID" |
+  jq -e '.[] | select(.ResponseType == "client.notify" and .Attributes.type == "success")'
+```
+
+Admin success is useful for operator checks, but it should not be presented as
+proof that a guest or normal signed-in browser user can execute the same action.
+
+### JavaScript/Fetch
+
+```javascript
+const response = await fetch('http://localhost:6336/action/cloud_store/create_folder', {
+  method: 'POST',
+  headers: {
+    'Authorization': 'Bearer ' + token,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    attributes: {
+      cloud_store_id: 'your-store-id',
+      name: 'new-folder',
+      path: ''
+    }
+  })
+});
+
+const results = await response.json();
+// results is an array of ResponseType objects
+```
+
+### Python
+
+```python
+import requests
+
+response = requests.post(
+    'http://localhost:6336/action/user_account/signin',
+    json={
+        'attributes': {
+            'email': 'user@example.com',
+            'password': 'password123'
+        }
+    }
+)
+
+for result in response.json():
+    if result['ResponseType'] == 'client.store.set':
+        token = result['Attributes']['value']
+```
+
+---
+
+## Action Permissions
+
+Actions use the same permission system as tables. Each action has its own permission that controls who can execute it.
+
+### Permission Levels
+
+| Level | Who Can Execute | Use Case |
+|-------|-----------------|----------|
+| **Guest** | Anyone, no login required | Public actions (signup, signin) |
+| **User** | The action's owner only | Personal actions |
+| **Group** | Members of assigned groups | Team/role-based actions |
+| **Admin** | Administrators always | All actions |
+
+### Three Permission Checks
+
+When a user tries to execute an action, Daptin checks **three things**:
+
+1. **Entity Permission** - Can this user execute on this table type?
+2. **Action Permission** - Can this user execute this specific action?
+3. **Row Permission** (instance actions only) - Can this user execute on this specific record?
+
+All three must pass for the action to run.
+
+### Schema-Managed Action Permissions
+
+Actions declared in schema files can define their row permission directly:
+
+```yaml
+Actions:
+  - Name: post_gig
+    Label: Post gig
+    OnType: gig
+    InstanceOptional: true
+    Permission: 32
+    OutFields:
+      - Method: ACTIONRESPONSE
+        Type: client.notify
+        Attributes:
+          type: success
+          title: Success
+          message: posted
+```
+
+On startup, Daptin syncs this value into the `action.permission` column for both new and existing schema-managed actions.
+
+### Schema-Managed Action Usergroups
+
+Selected action usergroup membership is configured on the action with `AccessGroups`.
+
+```yaml
+Actions:
+  - Name: post_gig
+    Label: Post gig
+    OnType: gig
+    Permission: 32
+    AccessGroups:
+      - Name: administrators
+        Permission: 524288
+```
+
+This writes rows into `action_action_id_has_usergroup_usergroup_id` for that action only. The optional `Permission` value is stored on the relation row; if omitted, Daptin uses the relation table default permission.
+
+The broad table-level form is still supported when every schema-managed action should receive the same group:
+
+```yaml
+Tables:
+  - TableName: action
+    DefaultGroups:
+      - Name: administrators
+        Permission: 524288
+```
+
+If both forms include the same group, the action-level `AccessGroups` permission wins.
+
+### Cache Refresh
+
+Schema startup sync invalidates the action, action-permission, object-permission, and object-group caches for updated schema-managed actions. Manual permission changes made through the generic API do not require a restart, but a previously cached authorization decision can remain for up to the 10-second cache TTL.
+
+### View Action Permissions
+
+```bash
+# List actions with their permissions
+curl http://localhost:6336/api/action \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Each action has a `permission` field (integer). Common values:
+
+| Permission Value | Meaning |
+|------------------|---------|
+| 561441 | Generic public-action profile |
+| 2085120 | Post-admin locked action profile (no guest execute) |
+
+### Make an Action Public (Guest Accessible)
+
+To allow guests (unauthenticated users) to execute an action:
+
+```bash
+# Get the action ID first
+ACTION_ID=$(curl -s http://localhost:6336/api/action \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq -r '.data[] | select(.attributes.action_name == "your_action") | .id')
+
+# Update permission to include GuestExecute (561441)
+curl -X PATCH "http://localhost:6336/api/action/$ACTION_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "action",
+      "id": "'$ACTION_ID'",
+      "attributes": {
+        "permission": 561441
+      }
+    }
+  }'
+```
+
+`561441` is the generic public-action profile. For `signup` after `become_an_administrator`, use `2085152` instead: the admin transition locks `signup` to `2085120`, and re-enabling public signup only requires adding `GuestExecute` (`32`).
+
+### Restrict Action to Admin Only
+
+To make an action admin-only, remove guest and group execute bits:
+
+```bash
+curl -X PATCH "http://localhost:6336/api/action/$ACTION_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "action",
+      "id": "'$ACTION_ID'",
+      "attributes": {
+        "permission": 2085120
+      }
+    }
+  }'
+```
+
+### Assign Action to User Group
+
+**Tested ✓** - To restrict an action to specific user groups:
+
+1. Get the action and usergroup reference IDs
+2. Create a relation via the junction table using relationships (not attributes)
+
+```bash
+# Get action ID
+ACTION_ID=$(curl -s http://localhost:6336/api/action \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq -r '.data[] | select(.attributes.action_name == "your_action") | .id')
+
+# Get usergroup ID
+USERGROUP_ID=$(curl -s http://localhost:6336/api/usergroup \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq -r '.data[] | select(.attributes.name == "editors") | .id')
+
+# Link action to usergroup using relationships
+curl -X POST http://localhost:6336/api/action_action_id_has_usergroup_usergroup_id \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "action_action_id_has_usergroup_usergroup_id",
+      "attributes": {},
+      "relationships": {
+        "action_id": {
+          "data": {"type": "action", "id": "'$ACTION_ID'"}
+        },
+        "usergroup_id": {
+          "data": {"type": "usergroup", "id": "'$USERGROUP_ID'"}
+        }
+      }
+    }
+  }'
+```
+
+**Note:** Junction tables can be created via POST but cannot be listed via GET.
+
+### Permission Bits Reference
+
+For advanced users, here are the individual permission bits:
+
+| Bit | Name | Value | Description |
+|-----|------|-------|-------------|
+| 5 | GuestExecute | 32 | Guests can execute |
+| 12 | UserExecute | 4096 | Owner can execute |
+| 19 | GroupExecute | 524288 | Group members can execute |
+
+Common permission values:
+- `561441` = GuestPeek + GuestExecute + UserRead + UserExecute + GroupRead + GroupExecute
+- `2085120` = UserCRUD + UserExecute + GroupCRUD + GroupExecute (no guest access)
+- `2085152` = `2085120` + GuestExecute. This is the current post-admin reopen value for `signup`.
+
+### Default Action Permissions
+
+Built-in actions have sensible defaults:
+
+| Action | Default Access |
+|--------|----------------|
+| `signup` | Guest before first admin; disabled after admin setup until explicitly re-enabled |
+| `signin` | Guest (public, including after admin setup) |
+| `become_an_administrator` | Guest (first user only) |
+| `download_system_schema` | Admin/Owner |
+| `restart` | Admin only |
+| Cloud storage actions | Owner/Group/Admin |
+
+Schema actions without an explicit `Permission` keep the historical default of `ALLOW_ALL_PERMISSIONS` when inserted. Existing actions preserve their current permission unless the schema action includes `Permission`.
+
+See [[Permissions|Permissions]] for the complete permission system.
+
+---
+
+## Error Handling
+
+Failed actions return error notifications:
+
+```json
+[
+  {
+    "ResponseType": "client.notify",
+    "Attributes": {
+      "type": "error",
+      "title": "failed",
+      "message": "required reference id not provided"
+    }
+  }
+]
+```
+
+Common errors:
+- Missing required attributes
+- Invalid record ID (for instance actions)
+- Permission denied
+- Validation failure
+
+---
+
+## See Also
+
+- [[Custom-Actions|Custom-Actions]] - Creating actions with workflows
+- [[Authorization-Scenarios|Authorization Scenarios]] - Tested permission and action access patterns
+- [[Authorization-Scenario-Action-Access-Gates|Action Access Gates]] - Selected action access with `AccessGroups`
+- [[Cloud-Storage|Cloud-Storage]] - Cloud storage action examples
+- [[Authentication|Authentication]] - Auth action details
+- [[State-Machines|State-Machines]] - Trigger actions on state changes
+- [[Task-Scheduling|Task-Scheduling]] - Run actions on schedule

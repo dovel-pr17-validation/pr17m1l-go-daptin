@@ -1,0 +1,194 @@
+# Encryption
+
+Data encryption at rest and in transit.
+
+## Column Encryption
+
+Encrypt sensitive data at rest using `encrypted` column type:
+
+```yaml
+Tables:
+  - TableName: user_profile
+    Columns:
+      - Name: ssn
+        DataType: varchar(255)
+        ColumnType: encrypted
+
+      - Name: credit_card
+        DataType: varchar(255)
+        ColumnType: encrypted
+```
+
+## How It Works
+
+1. Data encrypted before storage
+2. Decrypted when retrieved
+3. Uses AES with the configured `encryption.secret` as raw key bytes
+4. AES requires a 16, 24, or 32 character secret
+
+## Encryption Key
+
+### Environment Variable
+
+```bash
+DAPTIN_ENCRYPTION_KEY="$(openssl rand -hex 16)" ./daptin
+```
+
+### Generate Key
+
+```bash
+openssl rand -hex 16
+```
+
+Do not use `openssl rand -base64 32` for `encryption.secret`: that command
+produces a 44-character string, which is not a valid AES key length when Daptin
+uses the value as raw bytes.
+
+## Encrypted Column Types
+
+| Column Type | Use Case |
+|-------------|----------|
+| `encrypted` | General encrypted text |
+| `bcrypt` | Password hashing (one-way) |
+
+## Password Hashing
+
+Use `bcrypt` for passwords (cannot be decrypted):
+
+```yaml
+Columns:
+  - Name: password
+    DataType: varchar(255)
+    ColumnType: bcrypt
+```
+
+## API Behavior
+
+### Write
+
+Data automatically encrypted:
+
+```bash
+curl -X POST http://localhost:6336/api/user_profile \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "user_profile",
+      "attributes": {
+        "ssn": "123-45-6789"
+      }
+    }
+  }'
+```
+
+### Read
+
+Data automatically decrypted for authorized users:
+
+```bash
+curl http://localhost:6336/api/user_profile/ID \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Response:**
+```json
+{
+  "data": {
+    "type": "user_profile",
+    "attributes": {
+      "ssn": "123-45-6789"
+    }
+  }
+}
+```
+
+## Database Storage
+
+In database, encrypted data looks like:
+
+```
+AES256:iv:ciphertext:tag
+```
+
+## Key Rotation
+
+Daptin does not provide a verified online bulk re-encryption action. Do not
+change the encryption secret in place: existing encrypted credentials, private
+keys, OTP secrets, and encrypted columns may become unreadable.
+
+Treat rotation as a controlled migration: fence writes, back up the SQL
+database and old secret together, inventory every encrypted resource through
+the normal Daptin APIs, migrate each value while the old key is available,
+verify decryption/provider access in an isolated restore, then cut over. Keep a
+rollback copy of both database and old secret until verification completes.
+Never log plaintext during the migration. A wrong or missing key must be
+treated as a failed restore/readiness condition, not as permission to generate
+a replacement secret.
+
+## TLS in Transit
+
+### Enable HTTPS
+
+```bash
+DAPTIN_TLS_CERT_PATH=/path/to/cert.pem \
+DAPTIN_TLS_KEY_PATH=/path/to/key.pem \
+./daptin
+```
+
+### Database TLS
+
+MySQL:
+```
+DAPTIN_DB_CONNECTION_STRING="user:pass@tcp(host:3306)/db?tls=true"
+```
+
+PostgreSQL:
+```
+DAPTIN_DB_CONNECTION_STRING="host=db sslmode=require user=daptin password=pass dbname=daptin"
+```
+
+## Sensitive Data Best Practices
+
+1. **Use encrypted columns** for PII, financial data
+2. **Use bcrypt** for passwords
+3. **Enable TLS** for all connections
+4. **Rotate keys** periodically
+5. **Audit access** to sensitive columns
+
+## Encryption at Rest
+
+### Full Database Encryption
+
+Use database-level encryption:
+
+**MySQL:**
+```sql
+ALTER TABLE tablename ENCRYPTION='Y';
+```
+
+**PostgreSQL:**
+Use pgcrypto or Transparent Data Encryption (TDE).
+
+### Disk Encryption
+
+Use LUKS or similar for disk-level encryption.
+
+## Audit Logging
+
+Track access to encrypted data:
+
+```yaml
+Tables:
+  - TableName: sensitive_data
+    Columns:
+      - Name: secret
+        ColumnType: encrypted
+    Audit: true
+```
+
+## Performance
+
+Encryption adds overhead:
+- ~5-10% for read/write
+- Consider caching for frequently accessed data

@@ -1,0 +1,566 @@
+# LLM Gateway
+
+> **Configuration:** The gateway uses `llm_provider`, `llm_model`, and
+> `llm_deployment` resources;
+> provider rows alone do not expose models.
+> Responses file inputs can be enabled with the `files` model capability in
+> `llm_model`.
+
+Daptin exposes one OpenAI-compatible gateway backed by the reusable
+`github.com/daptin/llmgateway` engine. HTTP requests and the built-in LLM
+actions share the same catalog, authorization, routing, provider adapters,
+reliability controls, cost calculation, and generic metering lifecycle.
+
+Configuration uses ordinary Daptin resources and relationships:
+
+- `llm_provider` describes one provider account and links to a `credential`;
+- `llm_model` defines a public model name and its allowed capabilities;
+- `llm_deployment` maps a public model to an upstream provider/model;
+- `api_plan`, `api_member`, `api_usage`, and `api_quota` provide generic
+  metering for LLM and non-LLM workloads.
+
+There is no comma-separated provider model list and no provider-specific usage
+ledger. Catalog changes are reloaded after resource events, with periodic
+fingerprint polling as recovery; a server restart is not required.
+
+## Supported provider adapters
+
+The gateway uses the strict OpenAI-compatible adapter.
+
+| `provider_type` | Default base URL |
+|---|---|
+| `openai` | `https://api.openai.com/v1` |
+| `google` | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| `openrouter` | `https://openrouter.ai/api/v1` |
+| `lilac` | `https://api.getlilac.com/v1` |
+| `openai-compatible` | none; `base_url` is required |
+
+Each provider credential must contain a non-empty `api_key`:
+
+```json
+{"api_key":"provider-secret"}
+```
+
+HTTPS is required by default. An HTTP endpoint requires
+`allow_insecure: true`; loopback, link-local, or private-network access
+separately requires `allow_private_network: true`. Redirects are not followed.
+
+The OpenAI-compatible `provider_parameters` object accepts only:
+
+```json
+{
+  "organization": "optional OpenAI organization",
+  "project": "optional OpenAI project",
+  "image_generation_path": "/images/generations"
+}
+```
+
+`image_generation_path` may be `/images/generations` or `/images`.
+
+### Local Ollama through the OpenAI-compatible adapter
+
+Ollama's OpenAI-compatible API was exercised with non-streaming chat, SSE
+streaming, and model listing. Configure it as `openai-compatible`; it is not a
+separate provider type:
+
+```json
+{
+  "name": "local-ollama",
+  "provider_type": "openai-compatible",
+  "base_url": "http://127.0.0.1:11434/v1",
+  "provider_parameters": "{}",
+  "allow_insecure": true,
+  "allow_private_network": true,
+  "enable": true
+}
+```
+
+Link a credential containing a non-empty placeholder API key, for example
+`{"api_key":"ollama"}`, then create the normal `llm_model` and
+`llm_deployment` relationships described below. Set the deployment's upstream
+model name to one already pulled by Ollama.
+
+> **Compatibility caveat:** OpenAI-compatible does not mean every request
+> field has identical semantics. In the audit, `max_tokens: 32` was
+> accepted but Ollama reported 124 output tokens. Treat adapter fields not
+> explicitly verified by the upstream as unsupported/ignored, and test limits
+> using the returned usage before relying on them for cost or safety. Durable
+> Daptin metering remains separate from provider-side generation controls.
+
+```bash
+curl http://localhost:6336/v1/chat/completions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"assistant","messages":[{"role":"user","content":"Reply briefly"}],"max_tokens":32,"stream":false}' | jq '.usage'
+```
+
+## Configure the gateway
+
+The examples use JSON:API resource reference IDs. Keep provider secrets out of
+shell history and source control; the inline value below is only a placeholder.
+
+### 1. Create and link a credential
+
+```bash
+curl -X POST http://localhost:6336/api/credential \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "credential",
+      "attributes": {
+        "name": "gateway-provider-key",
+        "content": "{\"api_key\":\"provider-secret\"}"
+      }
+    }
+  }'
+```
+
+```bash
+curl -X POST http://localhost:6336/api/llm_provider \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "llm_provider",
+      "attributes": {
+        "name": "primary-openai",
+        "provider_type": "openai",
+        "provider_parameters": "{}",
+        "enable": true
+      },
+      "relationships": {
+        "credential_id": {
+          "data": {"type": "credential", "id": "CREDENTIAL_REFERENCE_ID"}
+        }
+      }
+    }
+  }'
+```
+
+### 2. Create a public model
+
+Operations are `chat`, `text_completion`, `responses`, `response_compaction`,
+`embeddings`, `image_generation`, `image_edit`, `image_variation`, `moderation`, `rerank`, `audio_speech`,
+`audio_transcription`, `audio_translation`, `search`, and `ocr`. Capabilities
+are explicit and may include `tools`, `vision`, `audio`, `files`,
+`json_schema`, `logprobs`, `penalties`, `parallel_tools`, `reasoning`,
+`dimensions`, `token_ids`, `exact_cache`, and `public_cache`.
+
+```bash
+curl -X POST http://localhost:6336/api/llm_model \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "llm_model",
+      "attributes": {
+        "name": "assistant",
+        "operations": "[\"chat\",\"responses\"]",
+        "capabilities": "{\"tools\":true,\"vision\":true,\"json_schema\":true}",
+        "routing_strategy": "priority_weighted",
+        "fallback_models": "[]",
+        "default_parameters": "{\"chat\":{\"max_completion_tokens\":512}}",
+        "unsupported_parameter_policy": "reject",
+        "enable": true
+      }
+    }
+  }'
+```
+
+### Grant a usergroup permission to invoke the model
+
+Model invocation uses the ordinary Daptin execute permission system. A user may
+invoke a model when the active user belongs to a group related to the
+`llm_model` row and that relation grants `GroupExecute`. The wrapper action that
+contains `$llm.chat` has its own independent execute permission.
+
+First make the model group-only and create the access group:
+
+```bash
+curl -X PATCH "http://localhost:6336/api/llm_model/$MODEL_REFERENCE_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{"data":{"type":"llm_model","id":"'$MODEL_REFERENCE_ID'","attributes":{"permission":0}}}'
+
+GROUP_REFERENCE_ID=$(curl -s -X POST http://localhost:6336/api/usergroup \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{"data":{"type":"usergroup","attributes":{"name":"llm-assistant-users"}}}' | jq -r '.data.id')
+```
+
+Relate the user and model to that group through their normal Daptin relationship
+resources:
+
+```bash
+curl -X POST http://localhost:6336/api/user_account_user_account_id_has_usergroup_usergroup_id \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{"data":{"type":"user_account_user_account_id_has_usergroup_usergroup_id","attributes":{"user_account_id":"'$USER_REFERENCE_ID'","usergroup_id":"'$GROUP_REFERENCE_ID'"}}}'
+
+MODEL_GROUP_RELATION_ID=$(curl -s -X POST http://localhost:6336/api/llm_model_llm_model_id_has_usergroup_usergroup_id \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{"data":{"type":"llm_model_llm_model_id_has_usergroup_usergroup_id","attributes":{"llm_model_id":"'$MODEL_REFERENCE_ID'","usergroup_id":"'$GROUP_REFERENCE_ID'"}}}' | jq -r '.data.id')
+
+curl -X PATCH "http://localhost:6336/api/llm_model_llm_model_id_has_usergroup_usergroup_id/$MODEL_GROUP_RELATION_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{"data":{"type":"llm_model_llm_model_id_has_usergroup_usergroup_id","id":"'$MODEL_GROUP_RELATION_ID'","attributes":{"permission":524288}}}'
+```
+
+`524288` is `GroupExecute`. Setting permission on a relationship is a PATCH
+after creating it. Model discovery and invocation use the same execute check, so
+`GET /v1/models` lists exactly the models the active account can invoke.
+
+### Allow guest invocation
+
+Guest access uses the same model permission field. Grant `GuestExecute` on the
+model; no OAuth client or service account is involved:
+
+```bash
+curl -X PATCH "http://localhost:6336/api/llm_model/$MODEL_REFERENCE_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  --data-binary '{"data":{"type":"llm_model","id":"'$MODEL_REFERENCE_ID'","attributes":{"permission":32}}}'
+
+curl http://localhost:6336/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  --data-binary '{"model":"assistant","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+`32` is `GuestExecute`. Daptin permissions are bitsets; use the normal
+permission editor or the combined bit value when the model must retain other
+permission bits. Removing `GuestExecute` immediately removes the model from
+guest discovery and denies guest invocation.
+
+`fallback_models` is an ordered JSON array of other public model names. Cycles
+or missing models reject the candidate catalog. Supported parameter policies
+are:
+
+- `reject`: reject a request that asks for a capability the model does not
+  declare;
+- `drop`: remove only optional non-semantic controls; semantic media or tool
+  history is never silently removed;
+- `passthrough`: preserve typed fields when the selected adapter supports them.
+
+Unknown wire fields are always rejected.
+
+### 3. Create a deployment and its relationships
+
+```bash
+curl -X POST http://localhost:6336/api/llm_deployment \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "llm_deployment",
+      "attributes": {
+        "name": "assistant-primary",
+        "upstream_model": "gpt-4o-mini",
+        "operations": "[\"chat\",\"responses\"]",
+        "priority": 0,
+        "weight": 1,
+        "request_timeout_ms": 90000,
+        "connect_timeout_ms": 10000,
+        "max_concurrency": 100,
+        "rpm": -1,
+        "tpm": -1,
+        "pricing": "{\"input_tokens\":150000,\"output_tokens\":600000}",
+        "parameters": "{}",
+        "health_check": "{\"enabled\":true,\"interval_ms\":30000,\"timeout_ms\":5000,\"failure_threshold\":3}",
+        "enable": true
+      },
+      "relationships": {
+        "llm_model_id": {
+          "data": {"type": "llm_model", "id": "MODEL_REFERENCE_ID"}
+        },
+        "llm_provider_id": {
+          "data": {"type": "llm_provider", "id": "PROVIDER_REFERENCE_ID"}
+        }
+      }
+    }
+  }'
+```
+
+Deployments in the lowest eligible priority tier are selected by positive
+weight without replacement. Retryable failures may move to another deployment
+or an ordered fallback model, within the engine's bounded attempt and request
+deadlines. Disabled, unhealthy, saturated, rate-protected, or
+capability-incompatible deployments are excluded. A streaming request may
+switch only before its first client-visible event.
+
+Pricing is a single map from a usage measure to its fixed-point cost in micros
+per one million units. Canonical token keys are `input_tokens`,
+`output_tokens`, `cache_read_tokens`, `cache_write_tokens`, and
+`reasoning_tokens`. Providers may also report named measures such as
+`search_units`, `ocr_pages`, or `document_bytes`; those use the same map and
+cost calculator.
+
+## HTTP API
+
+The implemented OpenAI-compatible routes are:
+
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /v1/messages`
+- `POST /v1/responses` (stateless; `store` and `previous_response_id` are
+  rejected)
+- `POST /v1/responses/compact` (explicit input only;
+  `previous_response_id` is rejected)
+- `POST /v1/embeddings`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
+- `POST /v1/images/variations`
+- `POST /v1/moderations`
+- `POST /rerank`, `POST /v1/rerank`, and `POST /v2/rerank`
+- `POST /v1/audio/speech`
+- `POST /v1/audio/transcriptions`
+- `POST /v1/audio/translations`
+- `POST /v1/search` and `POST /v1/search/{tool}`
+- `POST /v1/ocr` and `POST /ocr`
+- file create/list/read/content/delete under `/v1/files`
+- batch create/list/read/cancel under `/v1/batches`
+- `GET /v1/models`
+- `GET /v1/models/{id}`
+
+Streaming chat, completion, Messages, and Responses requests emit SSE
+keepalives while setup or upstream generation is idle. Responses events are
+translated through typed contracts; unknown event names, conflicting event
+types, missing coordinates, and non-increasing sequence numbers are rejected.
+Provider-reported cached and reasoning token details are retained in compatible
+chat/completion and Responses usage objects and in Daptin's generic metering
+facts.
+
+Text completions have a native canonical operation and are never converted to
+chat. Files and batches are durable Daptin resources; their persistence,
+permissions, relationships, and assets use the ordinary resource lifecycle.
+Their CRUD permissions are independent of `llm_model` execute permission.
+The existing `document.document_content` asset column must be bound to a
+configured Daptin cloud store. File creation fails with `service_unavailable`
+before writing either resource when that canonical asset binding is absent.
+Responses `input_file` content accepts exactly one of inline `file_data`, an
+HTTP(S) `file_url`, or a Daptin `/v1/files` `file_id`. A Daptin file ID is read
+through the same permissioned file resource and normalized to inline content
+before model authorization, routing, metering, and provider invocation.
+
+### Responses files and web search
+
+Declare `files` on the public model before accepting any `input_file`. The
+capability check is shared by direct HTTP, actions, and other callers of the
+gateway engine. A request that uses files against a model without that
+capability is denied before provider invocation.
+
+This example sends inline content:
+
+```bash
+curl http://localhost:6336/v1/responses \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary '{
+    "model": "assistant",
+    "input": [{
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_file",
+          "file_data": "data:text/plain;base64,SGVsbG8gZnJvbSBEYXB0aW4=",
+          "filename": "note.txt"
+        },
+        {"type": "input_text", "text": "Summarize the attached note."}
+      ]
+    }]
+  }'
+```
+
+Replace `file_data` with exactly one of these forms when appropriate:
+
+```json
+{"type":"input_file","file_url":"https://example.com/report.pdf","filename":"report.pdf"}
+```
+
+```json
+{"type":"input_file","file_id":"DAPTIN_FILE_REFERENCE_ID"}
+```
+
+`file_url` must be an HTTP(S) URL without embedded credentials and is forwarded
+to the selected provider. Provider support for fetching that URL remains a
+provider capability. `file_id` is a Daptin reference ID returned by
+`POST /v1/files`; Daptin reads it as the active account through the existing
+file resource permission path. An inaccessible or missing file fails before
+the model provider is called. The resolved content and the original request
+must fit within the gateway request-size limit.
+
+Web search uses the existing `tools` capability; it does not have a separate
+model capability:
+
+```bash
+curl http://localhost:6336/v1/responses \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary '{
+    "model": "assistant",
+    "input": "Find the Daptin documentation and cite one source.",
+    "tools": [{"type": "web_search"}]
+  }'
+```
+
+For non-streaming calls, conforming providers return `web_search_call` output
+items. Streaming providers may emit
+`response.web_search_call.in_progress`,
+`response.web_search_call.searching`, and
+`response.web_search_call.completed`. The adapter is deliberately strict:
+vendor-namespaced output item types such as `openrouter:web_search` are rejected
+as provider errors rather than silently reinterpreted. Enable `tools` only for
+deployments verified to accept the request and return the canonical Responses
+shape.
+
+File access, model execution, and metering remain independent decisions.
+Permission to execute the model does not grant access to a referenced Daptin
+file, and permission to read a file does not grant model execution. Successful
+and provider-failed admitted calls terminalize through the same `api_usage`
+lifecycle.
+
+Model discovery and invocation use the `llm_model` row's ordinary execute
+permissions. A request without a signed-in account is evaluated as a guest, so
+`GuestExecute` makes that model available without an access token. Signed-in,
+owner, group, and administrator access use the same Daptin permission rules as
+other resources. Model listing hides models the active context cannot invoke.
+
+```bash
+curl http://localhost:6336/v1/chat/completions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "assistant",
+    "messages": [{"role":"user","content":"Hello"}],
+    "stream": false
+  }'
+```
+
+OpenAI SDKs can use `http://localhost:6336/v1` as their base URL and a Daptin
+bearer token as their API key.
+
+### Codex CLI
+
+Daptin accepts the documented stateless Codex Responses subset, including
+reasoning includes, input-item IDs, function tool namespaces, and web search
+tools. `include` and item IDs are preserved upstream. Unsupported fields,
+including `client_metadata`, are rejected instead of being silently ignored.
+
+Configure Codex with a Daptin bearer token in `DAPTIN_API_KEY`:
+
+```toml
+model = "assistant"
+model_provider = "daptin"
+
+[model_providers.daptin]
+name = "Daptin"
+base_url = "http://localhost:6336/v1"
+env_key = "DAPTIN_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+Codex sends tool definitions, reasoning controls, and
+`parallel_tool_calls` when those features are enabled. Declare `tools`,
+`parallel_tools`, and `reasoning` in the `llm_model.capabilities` JSON only when
+the selected upstream deployment supports them. A strict model rejects a
+requested capability that it does not declare.
+The `tools` capability covers function tools, namespaces, and web search; there
+is no second web-search policy flag.
+
+## Daptin actions
+
+`$llm.chat` and `$llm.embedding` use the same engine as HTTP. They apply the
+same strict request decoder, model authorization, route plan, provider call,
+costing, and generic metering. `$llm.chat` is non-streaming in action chains.
+After Daptin authorizes the containing action, its server-defined outcomes use
+the normal trusted action context. `SWITCH_USER` changes the active account for
+subsequent outcomes and their metering.
+
+```yaml
+OutFields:
+  - Type: $llm.chat
+    Method: EXECUTE
+    Reference: llm_result
+    Attributes:
+      model: assistant
+      messages:
+        - role: user
+          content: "~prompt"
+      max_completion_tokens: 256
+      temperature: 0.2
+```
+
+The chat result includes `content`, `role`, `model`, `finish_reason`, optional
+`tool_calls`, and `usage`. The embedding result includes `embeddings`, `model`,
+and `usage`. `usage` includes input/output/total/cache/reasoning tokens,
+`cost_micros`, and whether usage is estimated. Arbitrary `extra_params` are
+rejected; configure operation-scoped deployment parameters instead.
+
+## Metering and cost
+
+LLM metering composes with Daptin's generic metering resources; it is not an
+LLM-owned quota system. Admission reserves named measures before provider I/O,
+and completion/cancellation terminalizes the same `api_usage` record afterward.
+No database transaction remains open during provider inference or streaming.
+
+The emitted measures include `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `total_tokens`,
+and `cost_micros`, plus operation-specific named measures. The same `api_plan`
+limits can be applied to any other metered Daptin resource using its own named
+measures.
+
+LLM invocation is metered through the `invoke` setting on the `llm_model`
+resource. It is enabled by default. To change the cost expression, measured
+quantity, or billing action, edit that resource's `metering.on_actions.invoke`
+setting in the world schema. See [[API-Metering]] for the complete setup.
+
+Hard limits use the database-backed generic quota state and fail closed when
+that authority is unavailable. Olric counters protect deployments
+(`max_concurrency`, RPM, TPM) and do not replace durable customer quotas.
+
+The active account determines metering ownership. Guest invocation uses the
+persisted guest account for usage and any configured plan limits while remaining
+unauthenticated for model permissions. Without `SWITCH_USER`, a signed-in caller
+is the metered account. After a trusted action performs `SWITCH_USER`, the
+selected account's `api_member`, plan, usage, and quota are used.
+If the wrapper action is itself metered, its admission occurred before the
+switch and remains charged to the original caller.
+
+An account without an active `api_member` still produces `api_usage`, but it has
+no plan-defined maximum. Assign an active membership whenever a hard or soft
+limit is required. See [[API-Metering]] for the shared ledger lifecycle.
+
+## Health, reload, and shutdown
+
+- `/llm/healthz` reports process liveness.
+- `/llm/readyz` requires a valid active catalog and reports rejected reloads.
+- Resource events trigger a debounced reload; a periodic content fingerprint
+  recovers missed events and observes credential version changes.
+- Invalid candidates never replace the last valid immutable snapshot.
+- Shutdown stops new admission, waits for bounded in-flight requests, then
+  closes adapter transports before Daptin closes shared database/Olric state.
+
+## Troubleshooting
+
+- **Model not found:** verify the public `llm_model.name`, its `enable` flag,
+  operation list, the active account's execute permission (or `GuestExecute`
+  for a request without an account), and at least one enabled deployment.
+- **No healthy deployment:** verify provider/deployment enable flags,
+  capabilities, operation lists, timeouts, health state, and protection limits.
+- **Provider authentication error:** verify the provider's credential relationship and
+  that decrypted credential content contains a non-empty `api_key`.
+- **Responses file rejected:** verify that the model declares `files`, that
+  exactly one of `file_data`, `file_url`, or `file_id` is present, and that the
+  active account can read a referenced Daptin file. An upstream error after
+  admission means the selected provider/model rejected the file form.
+- **Web search provider error:** verify that the model declares `tools` and that
+  the selected provider returns canonical `web_search_call` items rather than a
+  vendor-namespaced output type.
+- **Catalog reload rejected:** inspect `/llm/readyz` and logs for the stable
+  failure stage; the previous valid catalog remains active.
+- **Quota denied:** inspect the user's active `api_member`, related `api_plan`,
+  and the generic `api_quota` bucket for the named metric/window.

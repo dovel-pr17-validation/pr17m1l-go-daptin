@@ -1,0 +1,421 @@
+# Data Actions
+
+Actions for importing, exporting, and managing data.
+
+**Related**: [[Data-Exchange|Data Exchange]] | [[Cloud-Storage|Cloud Storage]] | [[Actions-Overview|Actions Overview]]
+
+---
+
+## export_data
+
+Export table data in multiple formats.
+
+**Action**: `export_data`
+**OnType**: `world`
+**InstanceOptional**: true (no instance ID required)
+
+```bash
+curl -X POST http://localhost:6336/action/world/export_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "table_name": "todo",
+      "format": "json"
+    }
+  }'
+```
+
+**Parameters**:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `table_name` | string | Table to export (optional - exports all if omitted) |
+| `format` | string | Output format: `json`, `csv`, `xlsx`, `pdf`, `html` (default: `json`) |
+| `columns` | array | Specific columns to export (optional - all if omitted) |
+| `include_headers` | bool | Include column headers (default: true) |
+| `page_size` | int | Records per batch for streaming (default: 1000) |
+
+**Response**:
+```json
+[
+  {
+    "ResponseType": "client.file.download",
+    "Attributes": {
+      "content": "base64-encoded-data",
+      "name": "daptin_export_todo.json",
+      "contentType": "application/json",
+      "message": "Downloading data as json"
+    }
+  }
+]
+```
+
+If a requested table cannot be exported, the action returns an error instead of an incomplete download.
+
+### Export Formats
+
+| Format | Content-Type | Extension |
+|--------|--------------|-----------|
+| `json` | application/json | .json |
+| `csv` | text/csv | .csv |
+| `xlsx` | application/vnd.openxmlformats-officedocument.spreadsheetml.sheet | .xlsx |
+| `pdf` | application/pdf | .pdf |
+| `html` | text/html | .html |
+
+### Export Specific Columns
+
+```bash
+curl -X POST http://localhost:6336/action/world/export_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "table_name": "todo",
+      "format": "csv",
+      "columns": ["title", "completed", "created_at"]
+    }
+  }'
+```
+
+---
+
+## export_csv_data
+
+Export specifically as CSV (shortcut for export_data with format=csv).
+For a nonempty table, the download includes column headers and data rows.
+
+**Action**: `export_csv_data`
+**OnType**: `world`
+**InstanceOptional**: true
+
+```bash
+curl -X POST http://localhost:6336/action/world/export_csv_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "table_name": "todo"
+    }
+  }'
+```
+
+---
+
+## import_data
+
+Import data from files into a table.
+
+The action handler checks execute permission on the selected `world` record,
+the `world` resource, and the `import_data` action, using its normal
+administrator rules. Importing a file with an invalid row fails the action and
+rolls back all files in that request, including any requested truncation.
+
+**Action**: `import_data`
+**OnType**: `world`
+**Instance action**: requires the table's `world` reference ID.
+
+```bash
+# First get the table's reference_id from the world table
+TABLE_REF=$(curl -s "http://localhost:6336/api/world?page%5Bsize%5D=100" \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq -r '.data[] | select(.attributes.table_name == "todo") | .id')
+
+# Then import data
+curl -X POST "http://localhost:6336/action/world/import_data" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "world_id": "'"$TABLE_REF"'",
+      "dump_file": [{
+        "name": "todos.csv",
+        "file": "data:text/csv;base64,dGl0bGUsY29tcGxldGVkClRhc2sgMSxmYWxzZQpUYXNrIDIsdHJ1ZQ=="
+      }],
+      "truncate_before_insert": false,
+      "batch_size": 100
+    }
+  }'
+```
+
+**Parameters**:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `dump_file` | array | Files to import (base64-encoded with name) |
+| `truncate_before_insert` | bool | Clear table before import (default: false) |
+| `batch_size` | int | Rows passed to the importer at a time (default: 100) |
+
+**File format**: Each file in `dump_file` array:
+```json
+{
+  "name": "filename.csv",
+  "file": "data:text/csv;base64,BASE64_CONTENT"
+}
+```
+
+Base64 file data counts toward the action's complete request-body limit. See
+[[Configuration#buffered-request-bodies|Buffered request bodies]] for the
+default, maximum, and HTTP 413 behavior.
+
+**Supported file formats**:
+- CSV (`.csv`)
+- JSON (`.json`)
+- Excel (`.xlsx`)
+
+**Example response**:
+```json
+[
+  {
+    "ResponseType": "client.notify",
+    "Attributes": {
+      "message": "Import completed in 123ms. 50 rows imported successfully across 1 table.",
+      "rows_imported": 50,
+      "successful_tables": 1,
+      "failed_tables": 0
+    }
+  }
+]
+```
+
+JSON exported by `export_data` can also be imported as a single table-keyed
+object, such as `{"todo":[{"title":"Task 1"}]}`. The table name must match
+the selected `world` record.
+
+### JSON Import Format
+
+```json
+[
+  {"title": "Task 1", "completed": false},
+  {"title": "Task 2", "completed": true}
+]
+```
+
+### CSV Import Format
+
+```csv
+title,completed
+Task 1,false
+Task 2,true
+```
+
+---
+
+## import_files_from_store
+
+Import files from cloud storage into a table.
+
+**Action**: `import_files_from_store`
+**OnType**: `world`
+**InstanceOptional**: false (requires table's world reference_id)
+
+```bash
+curl -X POST "http://localhost:6336/action/world/import_files_from_store" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "world_id": "'"$TABLE_REF"'",
+      "table_name": "todo"
+    }
+  }'
+```
+
+**Prerequisites**: Table must have a cloud_store relationship configured.
+
+---
+
+## generate_random_data
+
+Generate test data for a table using faker library.
+
+**Action**: `generate_random_data`
+**OnType**: `world`
+**InstanceOptional**: true
+
+```bash
+curl -X POST http://localhost:6336/action/world/generate_random_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "table_name": "todo",
+      "count": 100
+    }
+  }'
+```
+
+**Parameters**:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `table_name` | string | Table to populate |
+| `count` | int | Number of records to generate (must be > 0) |
+
+**Faker type detection** based on column types:
+- `email` → email address
+- `name`, `label` → person name or lorem words
+- `content` → paragraph text
+- `datetime`, `date` → random date
+- `measurement`, `rating` → random number
+- `truefalse` → random boolean
+- `url` → URL
+
+---
+
+## upload_file
+
+Upload file to cloud storage.
+
+**Action**: `upload_file`
+**OnType**: `cloud_store`
+**InstanceOptional**: false (requires cloud_store reference_id)
+
+```bash
+curl -X POST "http://localhost:6336/action/cloud_store/upload_file" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "cloud_store_id": "'"$CLOUDSTORE_REF"'",
+      "file": [{
+        "name": "document.pdf",
+        "file": "data:application/pdf;base64,BASE64_CONTENT"
+      }],
+      "path": "/uploads/"
+    }
+  }'
+```
+
+**Parameters**:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `file` | array | File(s) to upload (base64-encoded) |
+| `path` | string | Destination path in cloud store |
+
+See [[Cloud-Storage|Cloud Storage]] for cloud_store setup.
+
+---
+
+## Streaming Export for Large Data
+
+For large datasets, use streaming with page_size:
+
+```bash
+curl -X POST http://localhost:6336/action/world/export_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "table_name": "large_table",
+      "format": "csv",
+      "page_size": 10000
+    }
+  }'
+```
+
+Data is streamed in chunks to avoid memory issues.
+
+---
+
+## Batch Import for Large Data
+
+For large imports, adjust batch_size:
+
+```bash
+curl -X POST "http://localhost:6336/action/world/import_data" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "world_id": "'"$TABLE_REF"'",
+      "dump_file": [...],
+      "batch_size": 1000
+    }
+  }'
+```
+
+The parser passes up to `batch_size` rows at a time to the importer. Each row is
+inserted separately in the action's transaction.
+
+---
+
+## Complete Import/Export Workflow
+
+### Export Data for Backup
+
+```bash
+# Export the selected table as JSON
+curl -X POST http://localhost:6336/action/world/export_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {"table_name": "todo", "format": "json"}}'
+
+# Export specific table as CSV
+curl -X POST http://localhost:6336/action/world/export_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes": {"table_name": "todo", "format": "csv"}}'
+```
+
+### Import Data from Backup
+
+```bash
+# Get table reference_id
+TABLE_REF=$(curl -s "http://localhost:6336/api/world?page%5Bsize%5D=100" \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq -r '.data[] | select(.attributes.table_name == "todo") | .id')
+
+# Import (truncate first for clean restore)
+curl -X POST "http://localhost:6336/action/world/import_data" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "world_id": "'"$TABLE_REF"'",
+      "dump_file": [{"name": "backup.json", "file": "..."}],
+      "truncate_before_insert": true
+    }
+  }'
+```
+
+---
+
+## Troubleshooting
+
+### "no reference id" on import_data
+
+Import requires the table's world record reference_id:
+```bash
+# Get the reference_id first
+curl -s "http://localhost:6336/api/world?page%5Bsize%5D=100" \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq -r '.data[] | select(.attributes.table_name == "todo") | .id'
+```
+
+### Import fails with "no files provided"
+
+Ensure `dump_file` is an array of file objects with `name` and `file` keys:
+```json
+{
+  "dump_file": [{
+    "name": "data.csv",
+    "file": "data:text/csv;base64,..."
+  }]
+}
+```
+
+### Export returns empty content
+
+1. Verify table exists and has data
+2. Check you have read permission on the table
+3. Verify column names if using `columns` parameter
+
+---
+
+## See Also
+
+- [[Data-Exchange|Data Exchange]] - Resource lifecycle action and HTTP targets
+- [[Cloud-Storage|Cloud Storage]] - File storage setup
+- [[Actions-Overview|Actions Overview]] - Action system details

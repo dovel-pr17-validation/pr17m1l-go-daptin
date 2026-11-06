@@ -1,0 +1,1141 @@
+# Action Reference
+
+Complete reference of all built-in actions in Daptin.
+
+Call actions at `/action/{entity}/{action_name}`. "Instance Required" means
+the action needs an existing record's public reference ID in
+`attributes.{entity}_id`; the record ID is not part of the URL.
+
+## User Account Actions
+
+### signup
+
+Register a new user account.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_account` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| name | label | Yes |
+| email | email | Yes |
+| mobile | label | No |
+| password | password | Yes |
+| passwordConfirm | password | Yes |
+
+```bash
+curl -X POST http://localhost:6336/action/user_account/signup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "name": "John Doe",
+      "email": "john@example.com",
+      "password": "secure123",
+      "passwordConfirm": "secure123"
+    }
+  }'
+```
+
+### signin
+
+Authenticate and get JWT token.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_account` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| email | email | Yes |
+| password | password | Yes |
+
+```bash
+curl -X POST http://localhost:6336/action/user_account/signin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "email": "john@example.com",
+      "password": "secure123"
+    }
+  }'
+```
+
+### reset-password
+
+Initiate password reset flow.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_account` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| email | email | Yes |
+
+```bash
+curl -X POST http://localhost:6336/action/user_account/reset-password \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "email": "john@example.com"
+    }
+  }'
+```
+
+### reset-password-verify
+
+Complete password reset with verification code.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_account` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| email | email | Yes |
+| otp | value | Yes |
+
+## OTP Actions
+
+### register_otp
+
+Register a mobile number for OTP authentication.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_account` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| mobile_number | label | Yes |
+
+### verify_otp
+
+Verify a six-digit OTP for the authenticated account owner. Requires a previously verified OTP profile and distributed attempt/replay protection.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_account` |
+| Instance Required | No |
+| Authentication | Required |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| otp | label | Yes |
+| mobile_number | label | No |
+| email | label | No |
+
+### send_otp
+
+Generate an OTP for the authenticated account owner's existing verified OTP profile. This action does not enroll arbitrary accounts.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_otp_account` |
+| Instance Required | No |
+| Authentication | Required |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| mobile_number | label | Yes |
+| email | label | No |
+
+### verify_mobile_number
+
+Verify a mobile number with OTP.
+
+| Property | Value |
+|----------|-------|
+| Entity | `user_otp_account` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| mobile_number | label | Yes |
+| email | label | No |
+| otp | label | Yes |
+
+## OAuth Actions
+
+**See also:** [[OAuth-Authentication|OAuth Authentication Guide]] for complete setup and examples.
+
+### oauth_login_begin
+
+Start OAuth authentication flow by generating authorization URL.
+
+| Property | Value |
+|----------|-------|
+| Entity | `oauth_connect` |
+| Instance Required | Yes; pass `oauth_connect_id` in action `attributes` |
+| Endpoint | `/action/oauth_connect/oauth_login_begin` |
+
+**Action Performer:** `oauth.client.redirect`
+
+This action has no provider-specific input fields. It is an instance action on one `oauth_connect` row; the selected row supplies `$.name` as the callback `authenticator` and `$.scope` as the requested scope.
+
+**Tested Example:**
+```bash
+curl -X POST http://localhost:6336/action/oauth_connect/oauth_login_begin \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{"oauth_connect_id":"019bf936-3dc0-7105-9cf9-468d766cae66"}}'
+```
+
+**Response:**
+```json
+[
+  {
+    "ResponseType": "client.store.set",
+    "Attributes": {
+      "key": "secret",
+      "value": "101004"
+    }
+  },
+  {
+    "ResponseType": "client.redirect",
+    "Attributes": {
+      "delay": 0,
+      "location": "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&client_id=...&state=101004",
+      "window": "self"
+    }
+  }
+]
+```
+
+Returns state token and OAuth provider authorization URL. Non-PKCE connections use a 5-minute TOTP state. When `oauth_connect.pkce_enabled` is true, Daptin stores a random state and PKCE verifier in `oauth_state` and sends a PKCE code challenge to the provider.
+
+### oauth.login.response
+
+Handle OAuth callback with authorization code and state.
+
+| Property | Value |
+|----------|-------|
+| Entity | `oauth_token` |
+| Instance Required | No |
+| Endpoint | `/action/oauth_token/oauth.login.response` |
+
+**Action Performer:** `oauth.login.response`
+
+**Input Fields:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| code | hidden | Yes | Authorization code from OAuth provider |
+| state | hidden | Yes | State token from oauth_login_begin |
+| authenticator | hidden | Yes | Name of oauth_connect record |
+
+**Tested Example:**
+```bash
+curl -X POST http://localhost:6336/action/oauth_token/oauth.login.response \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "code": "4/0AfJohXm...",
+      "state": "101004",
+      "authenticator": "google-login"
+    }
+  }'
+```
+
+**Success Response:**
+```json
+[
+  {
+    "ResponseType": "client.notify",
+    "Attributes": {
+      "title": "Successfully connected",
+      "message": "You can use this connection now",
+      "type": "success"
+    }
+  },
+  {
+    "ResponseType": "client.redirect",
+    "Attributes": {
+      "location": "/in/item/oauth_token"
+    }
+  }
+]
+```
+
+**Error Response (Invalid State):**
+```json
+[
+  {
+    "ResponseType": "client.notify",
+    "Attributes": {
+      "message": "No ongoing authentication",
+      "title": "failed",
+      "type": "error"
+    }
+  }
+]
+```
+
+**Workflow:**
+1. Validates state token (TOTP, 5-minute window)
+2. Exchanges authorization code for tokens
+3. Stores access/refresh tokens (encrypted)
+4. If `allow_login=true`: fetches profile, creates/links user, generates JWT
+5. Returns success or error notification
+
+### get_token
+
+Retrieve decrypted OAuth access and refresh tokens for a stored oauth_token record.
+
+| Property | Value |
+|----------|-------|
+| Entity | `oauth_token` |
+| Instance Required | Yes |
+| Endpoint | `/action/oauth_token/get_token` |
+
+**Action Performer:** `oauth.token`
+
+**Input Fields:** `attributes.oauth_token_id` (the token record reference ID)
+
+**Example:**
+```bash
+# Get oauth_token reference ID
+TOKEN_REF=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  http://localhost:6336/api/oauth_token | jq -r '.data[0].id')
+
+curl -X POST "http://localhost:6336/action/oauth_token/get_token" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"attributes\": {\"oauth_token_id\": \"$TOKEN_REF\"}}"
+```
+
+**Success Response:**
+```json
+[
+  {
+    "ResponseType": "oauth_token",
+    "Attributes": {
+      "access_token": "ya29.a0AfH6SM...",
+      "refresh_token": "1//0dx...",
+      "expiry": "2026-03-22T15:00:00Z"
+    }
+  }
+]
+```
+
+Omitting `oauth_token_id` fails with HTTP 400 because this action requires an
+existing `oauth_token` record.
+
+## Admin Actions
+
+### become_an_administrator
+
+Promote user to system administrator (first-time setup only).
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Action Performer:** `__become_admin`
+
+```bash
+curl -X POST http://localhost:6336/action/world/become_an_administrator \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{}}'
+```
+
+### download_system_schema
+
+Download complete system schema as JSON.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Action Performer:** `__download_cms_config`
+
+### upload_system_schema
+
+Upload schema file to update system configuration.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| schema_file | file.json\|yaml\|yml | Yes |
+
+## Table Management Actions
+
+### remove_table
+
+Delete a table from the system.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | Yes |
+
+**Action Performer:** `world.delete`
+
+Use the target table's `world` reference ID (from `/api/world`):
+
+```bash
+curl -X POST http://localhost:6336/action/world/remove_table \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{"world_id":"WORLD_REFERENCE_ID"}}'
+```
+
+This permanently removes the table and its data.
+
+### remove_column
+
+Delete a column from a table.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| column_name | label | Yes |
+
+**Action Performer:** `world.column.delete`
+
+### rename_column
+
+Rename an existing column.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| table_name | label | Yes |
+| column_name | label | Yes |
+| new_column_name | label | Yes |
+
+**Action Performer:** `world.column.rename`
+
+## Data Import/Export Actions
+
+### import_data
+
+Import data from dump file.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| dump_file | file.json\|csv\|xlsx | Yes |
+| truncate_before_insert | truefalse | No |
+| batch_size | measurement | No |
+
+**Action Performer:** `__data_import`
+
+```bash
+curl -X POST http://localhost:6336/action/world/import_data \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{"world_id":"WORLD_REFERENCE_ID","dump_file":[{"name":"data.json","file":"data:application/json;base64,BASE64_CONTENT"}],"truncate_before_insert":false}}'
+```
+
+See [Data Actions](Data-Actions.md#import_data) for import behavior and file formats.
+
+### export_data
+
+Export table data in various formats.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| table_name | label | Yes |
+| format | label | No (default: json) |
+| columns | label | No |
+| include_headers | truefalse | No |
+
+**Action Performer:** `__data_export`
+
+### export_csv_data
+
+Export table data as CSV.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| table_name | label | Yes |
+
+**Action Performer:** `__csv_data_export`
+
+### upload_csv_to_system_schema
+
+Import CSV data into entity.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| data_csv_file | file.csv | Yes |
+| entity_name | label | Yes |
+| create_if_not_exists | truefalse | No |
+| add_missing_columns | truefalse | No |
+
+**Action Performer:** `__upload_csv_file_to_entity`
+
+### upload_xls_to_system_schema
+
+Import Excel data into entity.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| data_xls_file | file.xls\|xlsx | Yes |
+| entity_name | label | Yes |
+| create_if_not_exists | truefalse | Yes |
+| add_missing_columns | truefalse | Yes |
+
+**Action Performer:** `__upload_xlsx_file_to_entity`
+
+### import_files_from_store
+
+Import files from cloud store to table.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| table_name | label | Yes |
+
+**Action Performer:** `cloud_store.files.import`
+
+### generate_random_data
+
+Generate random test data for a table.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| count | measurement | Yes (>0) |
+| table_name | label | Yes |
+
+**Action Performer:** `generate.random.data`
+
+## Cloud Storage Actions
+
+### upload_file
+
+Upload file to cloud store.
+
+| Property | Value |
+|----------|-------|
+| Entity | `cloud_store` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| file | file.* | Yes |
+| path | label | No |
+
+**Action Performer:** `cloudstore.file.upload`
+
+### create_folder
+
+Create folder in cloud store.
+
+| Property | Value |
+|----------|-------|
+| Entity | `cloud_store` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| path | label | No |
+| name | label | Yes |
+
+**Action Performer:** `cloudstore.folder.create`
+
+### delete_path
+
+Delete path from cloud store.
+
+| Property | Value |
+|----------|-------|
+| Entity | `cloud_store` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| path | label | Yes |
+
+**Action Performer:** `site.file.delete`
+
+### move_path
+
+Move file or folder in cloud store.
+
+| Property | Value |
+|----------|-------|
+| Entity | `cloud_store` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| source | label | Yes |
+| destination | label | Yes |
+
+**Action Performer:** `cloudstore.path.move`
+
+### create_site
+
+Create a new site from cloud store.
+
+| Property | Value |
+|----------|-------|
+| Entity | `cloud_store` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| site_type | label | Yes |
+| path | label | Yes |
+| hostname | label | Yes |
+
+**Action Performer:** `cloudstore.site.create`
+
+## Site Actions
+
+Site action paths are relative to the site's configured storage path. Paths
+that resolve outside it are rejected.
+
+### list_files
+
+List files in site path.
+
+| Property | Value |
+|----------|-------|
+| Entity | `site` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| path | label | Yes |
+
+**Action Performer:** `site.file.list`
+
+### get_file
+
+Get file content from site.
+
+| Property | Value |
+|----------|-------|
+| Entity | `site` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| path | label | Yes |
+
+**Action Performer:** `site.file.get`
+
+### delete_file
+
+Delete file from site.
+
+| Property | Value |
+|----------|-------|
+| Entity | `site` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| path | label | Yes |
+
+**Action Performer:** `site.file.delete`
+
+### sync_site_storage
+
+Sync site with cloud storage.
+
+| Property | Value |
+|----------|-------|
+| Entity | `site` |
+| Instance Required | Yes |
+
+This action has no input fields. It synchronizes the site's configured cloud
+store path into Daptin's server-managed local site cache.
+
+**Action Performer:** `site.storage.sync`
+
+### sync_column_storage
+
+Sync column with cloud storage.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | No |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| table_name | label | Yes |
+| column_name | label | Yes |
+| credential_name | label | Yes |
+
+**Action Performer:** `column.storage.sync`
+
+## Certificate Actions
+
+### generate_acme_certificate
+
+Generate Let's Encrypt ACME certificate.
+
+| Property | Value |
+|----------|-------|
+| Entity | `certificate` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| email | label | Yes |
+
+**Action Performer:** `acme.tls.generate`
+
+```bash
+curl -X POST http://localhost:6336/action/certificate/generate_acme_certificate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "email": "admin@example.com"
+    },
+    "certificate_id": "CERT_ID"
+  }'
+```
+
+### generate_self_certificate
+
+Generate self-signed certificate.
+
+| Property | Value |
+|----------|-------|
+| Entity | `certificate` |
+| Instance Required | Yes |
+
+**Action Performer:** `self.tls.generate`
+
+### download_certificate
+
+Download certificate PEM file.
+
+| Property | Value |
+|----------|-------|
+| Entity | `certificate` |
+| Instance Required | Yes |
+
+Returns: Certificate PEM file download
+
+### download_public_key
+
+Download public key PEM file.
+
+| Property | Value |
+|----------|-------|
+| Entity | `certificate` |
+| Instance Required | Yes |
+
+Returns: Public key PEM file download
+
+## Email Actions
+
+### mail.unpack
+
+Decode an authorized `mail` action subject into bounded normalized MIME parts
+for later outcomes. See [[Email-Actions#mailunpack-performer|Email Actions]] for
+the input, output, permission, and limit contract.
+
+### mail.send
+
+Send email via SMTP.
+
+**Action Performer:** `mail.send`
+
+**Parameters:**
+| Field | Type | Required |
+|-------|------|----------|
+| to | []string | Yes |
+| subject | string | Yes |
+| from | string | Yes; must match `mail_account.username` |
+| body | string | Yes |
+
+Queues one `outbox` row per recipient and appends one copy to the sender's
+`Sent` mailbox at queue time. Scheduled outbox retries do not duplicate the
+`Sent` copy.
+| mail_server_hostname | string | No |
+| send_immediately | bool | No |
+| attempt_delivery | bool | No |
+
+### aws.mail.send
+
+Send email via AWS SES.
+
+**Action Performer:** `aws.mail.send`
+
+**Parameters:**
+| Field | Type | Required |
+|-------|------|----------|
+| to | []string | Yes |
+| cc | []string | No |
+| bcc | []string | No |
+| subject | string | Yes |
+| from | string | Yes |
+| text | string | No* |
+| html | string | No* |
+| credential | string | Yes |
+
+*Either `text` or `html` is required.
+
+### sync_mail_servers
+
+Sync all mail server configurations.
+
+| Property | Value |
+|----------|-------|
+| Entity | `mail_server` |
+| Instance Required | No |
+
+**Action Performer:** `mail.servers.sync`
+
+## Integration Actions
+
+### Active user and `SWITCH_USER`
+
+Every integration credential or OAuth token is checked against the active user
+when the integration outcome runs. Direct and generated integration calls use
+the authenticated caller. A trusted backend action can change the active user
+for its remaining outcomes:
+
+```yaml
+OutFields:
+  - Type: __as_user
+    Method: SWITCH_USER
+    SkipInResponse: true
+    Attributes:
+      user_reference_id: "SERVICE_USER_REFERENCE_ID"
+
+  - Type: provider.example
+    Method: operationId
+    Attributes:
+      credential_id: "SERVICE_USER_CREDENTIAL_REFERENCE_ID"
+```
+
+The credential must be owned by the selected service user and grant owner read
+permission. Keep the user and credential references fixed in the backend action
+definition. A caller cannot supply `sessionUser`, and a fixed credential ID
+without `SWITCH_USER` is still authorized as the caller.
+
+### install_integration
+
+Install an API integration.
+
+| Property | Value |
+|----------|-------|
+| Entity | `integration` |
+| Instance Required | Yes; pass `integration_id` in action `attributes` |
+
+**Action Performer:** `integration.install`
+
+```bash
+curl -X POST "http://localhost:6336/action/integration/install_integration" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{"integration_id":"INTEGRATION_REFERENCE_ID"}}'
+```
+
+Installation also refreshes the in-memory integration operation mappings for the installed provider, so provider-scoped execution routes are available without restarting the server.
+
+### Provider-scoped integration operation
+
+Execute an installed OpenAPI operation under its provider namespace.
+
+Installation creates the canonical `integration` action
+`{provider_name}/{operation_id}`. Provider-scoped REST and the generated
+provider GraphQL mutation both invoke that action through the normal action
+handler. The active user must have execute permission on the `integration`
+entity and the generated action before Daptin loads a credential or contacts
+the provider.
+
+| Property | Value |
+|----------|-------|
+| Endpoint | `/integration/{provider_name}/{operation_id}` |
+| Method | `POST` |
+| Provider | `integration.name` |
+| Operation | OpenAPI `operationId` from `integration.specification` |
+
+Use these discovery endpoints before executing when you do not know the
+operation id or required fields:
+
+```http
+GET /integration/{provider_name}/operations
+GET /integration/{provider_name}/operations/{operation_id}
+GET /integration/{provider_name}/openapi.yaml
+```
+
+Execution body shape:
+
+```json
+{
+  "oauth_token_id": "optional OAuth token reference id",
+  "credential_id": "optional credential reference id",
+  "input": {
+    "operationParam": "value"
+  }
+}
+```
+
+For OAuth2 integrations, pass `oauth_token_id` when discovery exposes it. For
+custom credential integrations, pass `credential_id` when discovery exposes
+it. OpenAPI operation security determines whether that selector is required,
+optional, or absent. Other operation parameters go under `input`.
+Provider-scoped execution ignores runtime auth selector fields inside `input`;
+`oauth_token_id` and `credential_id` must be top-level request fields.
+
+**Example:**
+```bash
+curl -X POST "http://localhost:6336/integration/asana.com/getWorkspaces" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "oauth_token_id": "USER_OAUTH_TOKEN_REFERENCE_ID",
+    "input": {
+      "opt_fields": ["name"]
+    }
+  }'
+```
+
+Provider-scoped operation execution supports OpenAPI-backed REST operations by
+default. Operations can also declare GraphQL, WebSocket, or unary gRPC
+transports using `x-daptin-transport` and related operation extensions in the
+integration OpenAPI specification. See [[Integrations|Integrations]] for the
+transport extension fields and security rules.
+
+### get_action_schema
+
+Download action schema JSON.
+
+| Property | Value |
+|----------|-------|
+| Entity | `action` |
+| Instance Required | Yes |
+
+Returns: Action schema JSON file download
+
+## Data Exchange Actions
+
+### add_exchange
+
+Add a data exchange for Google Sheets sync.
+
+| Property | Value |
+|----------|-------|
+| Entity | `world` |
+| Instance Required | Yes |
+
+**Input Fields:**
+| Field | Type | Required |
+|-------|------|----------|
+| name | label | Yes |
+| sheet_id | alias | Yes |
+| app_key | alias | Yes |
+
+### process_data_exchange_executions
+
+Process one due durable data-exchange execution. The standard persisted task invokes
+this action automatically; administrators may also invoke it manually.
+
+| Property | Value |
+|----------|-------|
+| Entity | `exchange_run` |
+| Instance Required | No |
+| Permission | Administrator only |
+
+### retry_data_exchange_execution
+
+Return one terminal execution to the scheduled processor with a fresh bounded
+attempt budget. This action never calls the target directly.
+
+| Property | Value |
+|----------|-------|
+| Entity | `exchange_run` |
+| Instance Required | Yes |
+| Permission | Administrator only |
+
+Pass the execution reference as the normal instance-action attribute:
+
+```bash
+curl -X POST http://localhost:6336/action/exchange_run/retry_data_exchange_execution \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{"exchange_run_id":"EXECUTION_REFERENCE_ID"}}'
+```
+
+See [[Data-Exchange|Data Exchange]] for transaction, retry, and cluster
+behavior.
+
+## Transactional `ForEach` CRUD
+
+An outcome can repeat one trusted `POST`, `PATCH`, or `DELETE` operation over a
+bounded array.
+
+| Property | Meaning |
+|----------|---------|
+| `ForEach` | Expression resolving to an array of reference IDs or objects |
+| `MaxItems` | Required positive limit; server maximum is 1,000 |
+| `item` | Current item available to `Condition` and `Attributes` |
+| `item_index` | Zero-based current index |
+| `Reference` | Ordered collection of successful item results |
+
+Duplicate, malformed, and over-limit inputs are rejected. The first item error
+rolls back the action transaction. `ContinueOnError` is not supported. See
+[Transactional ForEach CRUD outcomes](Custom-Actions.md#transactional-foreach-crud-outcomes)
+for configuration, permission semantics, and examples.
+
+## Action Performers (Internal)
+
+These are the internal action executors:
+
+| Performer Name | Description |
+|----------------|-------------|
+| `site.storage.sync` | Sync site with cloud storage |
+| `oauth.token` | Generate OAuth token |
+| `world.column.rename` | Rename table column |
+| `cloud_store.files.import` | Import files from cloud store |
+| `oauth.client.redirect` | Start OAuth redirect flow |
+| `response.create` | Create action response |
+| `password.reset.verify` | Verify password reset code |
+| `cloudstore.folder.create` | Create folder in cloud store |
+| `column.storage.sync` | Sync column with storage |
+| `command.execute` | Execute system command |
+| `mail.servers.sync` | Sync mail servers |
+| `password.reset.begin` | Start password reset |
+| `cloudstore.site.create` | Create site from cloud store |
+| `world.delete` | Delete table |
+| `otp.login.verify` | Verify OTP login |
+| `__download_cms_config` | Download CMS configuration |
+| `site.file.list` | List site files |
+| `jwt.token` | Generate JWT token |
+| `self.tls.generate` | Generate self-signed certificate |
+| `integration.install` | Install integration |
+| `$transaction` | Transaction wrapper |
+| `__csv_data_export` | Export CSV data |
+| `site.file.delete` | Delete site file |
+| `aws.mail.send` | Send via AWS SES |
+| `mail.unpack` | Decode a stored RFC822 message |
+| `world.column.delete` | Delete column |
+| `random.generate` | Generate random values |
+| `mail.send` | Send email |
+| `oauth.login.response` | Handle OAuth response |
+| `__data_export` | Export data |
+| `cloudstore.path.move` | Move cloud store path |
+| `__upload_xlsx_file_to_entity` | Upload XLSX to entity |
+| `__data_import` | Import data |
+| `acme.tls.generate` | Generate ACME certificate |
+| `__become_admin` | Become administrator |
+| `$network.request` | Make network request |
+| `__upload_csv_file_to_entity` | Upload CSV to entity |
+| `oauth.profile.exchange` | Exchange OAuth profile |
+| `site.file.get` | Get site file |
+| `__enable_graphql` | Internal performer without a public action definition; use `/_config/backend/graphql.enable` |
+
+## Action Request Format
+
+All actions follow this request format:
+
+```bash
+curl -X POST http://localhost:6336/action/{entity}/{action_name} \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "attributes": {
+      "field1": "value1",
+      "field2": "value2"
+    }
+  }'
+```
+
+- `{entity}` - Target entity name (e.g., `user_account`, `world`)
+- `{action_name}` - Action name as defined
+- `attributes.{entity}_id` - Record reference ID required if `InstanceOptional: false`
+
+## Action Response Types
+
+Actions can return various response types:
+
+| Type | Description |
+|------|-------------|
+| `client.notify` | Display notification to user |
+| `client.redirect` | Redirect browser |
+| `client.file.download` | Trigger file download |
+| `jwt.token` | Return JWT authentication token |

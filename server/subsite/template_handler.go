@@ -1,0 +1,550 @@
+package subsite
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"github.com/artpar/api2go/v2"
+	_ "github.com/artpar/rclone/backend/all" // import all fs
+	"github.com/buraksezer/olric"
+	"github.com/daptin/daptin/server/actionresponse"
+	"github.com/daptin/daptin/server/cache"
+	"github.com/daptin/daptin/server/dbresourceinterface"
+	daptinid "github.com/daptin/daptin/server/id"
+	"github.com/daptin/daptin/server/permission"
+	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
+	log "github.com/sirupsen/logrus"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type JsonApiError struct {
+	Message string
+}
+
+type SubSite struct {
+	Id           int64
+	Name         string
+	Hostname     string
+	Path         string
+	CloudStoreId *int64 `db:"cloud_store_id"`
+	Permission   permission.PermissionInstance
+	SiteType     string                     `db:"site_type"`
+	FtpEnabled   bool                       `db:"ftp_enabled"`
+	UserId       *int64                     `db:"user_account_id"`
+	ReferenceId  daptinid.DaptinReferenceId `db:"reference_id"`
+	Enable       bool                       `db:"enable"`
+}
+
+type HostRouterProvider interface {
+	GetHostRouter(name string) *gin.Engine
+	GetAllRouter() []*gin.Engine
+}
+
+var fileCache *cache.FileCache
+
+func ShutdownTemplateCache() {
+	if fileCache != nil {
+		fileCache.Close()
+	}
+}
+
+// generateCacheKey creates a unique key for the cache based on the request and configuration
+func generateCacheKey(c *gin.Context, config *CacheConfig) string {
+	if config == nil {
+		return ""
+	}
+
+	// Start with the path
+	key := c.Request.URL.Path
+
+	// Add prefix if configured
+	if config.CacheKeyPrefix != "" {
+		key = config.CacheKeyPrefix + ":" + key
+	}
+
+	// Add query parameters if configured to vary by them
+	if len(config.VaryByQueryParams) > 0 {
+		queryValues := c.Request.URL.Query()
+		for _, param := range config.VaryByQueryParams {
+			if values, exists := queryValues[param]; exists {
+				for _, value := range values {
+					key += ":" + param + "=" + value
+				}
+			}
+		}
+	}
+
+	// Add headers if configured to vary by them
+	if len(config.VaryByHeaders) > 0 {
+		for _, header := range config.VaryByHeaders {
+			value := c.GetHeader(header)
+			if value != "" {
+				key += ":" + header + "=" + value
+			}
+		}
+	}
+
+	return key
+}
+
+func CreateTemplateHooks(transaction *sqlx.Tx, cruds map[string]dbresourceinterface.DbResourceInterface, hostSwitch HostRouterProvider, olricDb *olric.EmbeddedClient, gzipEnabled bool) error {
+	allRouters := hostSwitch.GetAllRouter()
+	templateList, err := cruds["template"].GetAllObjects("template", transaction)
+	log.Infof("Got [%d] Templates from database", len(templateList))
+	if err != nil {
+		return err
+	}
+	if fileCache == nil {
+		fileCache, err = cache.NewFileCache(olricDb, "template-cache")
+		CheckErr(err, "Failed to create olric template cache")
+	}
+
+	handlerCreator := CreateTemplateRouteHandler(cruds, transaction, gzipEnabled)
+	for _, templateRow := range templateList {
+		log.Infof("ProcessTemplateRoute [%s] %v", templateRow["name"], templateRow["url_pattern"])
+		urlPattern := templateRow["url_pattern"].(string)
+		strArray := make([]string, 0)
+		err = json.Unmarshal([]byte(urlPattern), &strArray)
+		if err != nil {
+			log.Errorf("Failed to parse url pattern [%v] as string array [%v]", urlPattern, err)
+			continue
+		}
+		templateRenderHelper := handlerCreator(templateRow)
+		for _, urlMatch := range strArray {
+			log.Infof("TemplateRoute [%s] => %s", urlMatch, templateRow["name"])
+			for _, router := range allRouters {
+				router.Any(urlMatch, templateRenderHelper)
+			}
+		}
+	}
+	return nil
+}
+
+func CreateTemplateRouteHandler(cruds map[string]dbresourceinterface.DbResourceInterface, transaction *sqlx.Tx, gzipEnabled bool) func(template map[string]interface{}) func(ginContext *gin.Context) {
+	return func(templateInstance map[string]interface{}) func(ginContext *gin.Context) {
+
+		templateName := templateInstance["name"].(string)
+		actionConfigInterface := templateInstance["action_config"]
+		cacheConfigInterface := templateInstance["cache_config"]
+		actionRequest, err := GetActionConfig(actionConfigInterface)
+		if err != nil {
+			log.Errorf("Failed to get template instance for template [%v]", templateName)
+		}
+
+		var cacheConfig *CacheConfig
+		cacheConfig, err = GetCacheConfig(cacheConfigInterface)
+		if err != nil {
+			log.Errorf("Failed to get template instance for template [%v]", templateName)
+		}
+		// Get the Olric cache instance
+		log.Infof("Cache config for [%v] [%v]", templateName, cacheConfig)
+
+		return func(c *gin.Context) {
+
+			// Apply caching configuration if available
+			log.Tracef("Serve template[%s] request[%s]", templateName, c.Request.URL.Path)
+			upstreamGzip := c.Writer.Header().Get("Content-Encoding") == "gzip"
+			var cacheKey string
+			if cacheConfig != nil && cacheConfig.Enable {
+				if cacheConfig.EnableInMemoryCache && !cacheConfig.NoStore && !cacheConfig.NoCache && !cacheConfig.Private && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) {
+					cacheKey = generateCacheKey(c, cacheConfig)
+				}
+
+				// Apply cache control headers based on configuration
+				applyCacheHeaders(c, cacheConfig)
+				if gzipEnabled {
+					c.Header("Vary", appendTemplateVary(c.Writer.Header().Get("Vary"), "Accept-Encoding"))
+				}
+
+				if cacheKey != "" {
+					if cachedFile, found := fileCache.Get(cacheKey); found {
+						if len(cachedFile.Headers) > 0 {
+							serveCachedTemplate(c, cachedFile, gzipEnabled, upstreamGzip)
+							return
+						}
+					}
+				}
+			}
+
+			inFields := make(map[string]interface{})
+
+			inFields["template"] = templateName
+			queryMap := make(map[string]interface{})
+			inFields["query"] = queryMap
+
+			for _, param := range c.Params {
+				inFields[param.Key] = param.Value
+			}
+
+			queryParams := c.Request.URL.Query()
+
+			for key, valArray := range queryParams {
+				if len(valArray) == 1 {
+					inFields[key] = valArray[0]
+					inFields[key+"[]"] = valArray
+				} else {
+					inFields[key] = valArray
+					inFields[key+"[]"] = valArray
+				}
+			}
+
+			var outcomeRequest actionresponse.Outcome
+			var transaction1 *sqlx.Tx
+			var errTxn error
+			transaction1, errTxn = cruds["world"].Connection().Beginx()
+			if errTxn != nil {
+				_ = c.AbortWithError(500, errTxn)
+				return
+			}
+			defer func() {
+				_ = transaction1.Commit()
+			}()
+
+			var api2goRequestData = api2go.Request{
+				PlainRequest: c.Request,
+				QueryParams:  c.Request.URL.Query(),
+				Pagination:   nil,
+				Header:       c.Request.Header,
+				Context:      nil,
+			}
+
+			if len(actionRequest.Action) > 0 && len(actionRequest.Type) > 0 {
+				actionRequest.Attributes = inFields
+				actionResponses, errAction := cruds["action"].HandleActionRequest(actionRequest, api2goRequestData, transaction1)
+				if errAction != nil {
+					_ = c.AbortWithError(500, errAction)
+					return
+				}
+				inFields["actionResponses"] = actionResponses
+
+				for _, actionResponse := range actionResponses {
+					inFields[actionResponse.ResponseType] = actionResponse.Attributes
+				}
+			}
+
+			api2goResponder, _, err := cruds["world"].GetActionHandler("template.render").DoAction(
+				outcomeRequest, inFields, transaction1)
+			if err != nil && len(err) > 0 {
+				_ = c.AbortWithError(500, err[0])
+				return
+			}
+
+			api2GoResult := api2goResponder.Result().(api2go.Api2GoModel)
+
+			attrs := api2GoResult.GetAttributes()
+			var content = attrs["content"].(string)
+			var mimeType = attrs["mime_type"].(string)
+			var headers = attrs["headers"].(map[string]string)
+
+			// Decode content first to use for ETag generation if needed
+			decodedContent := Atob(content)
+			data := []byte(decodedContent)
+			renderedAt := time.Now().UTC()
+			var compressedData []byte
+			if gzipEnabled && cache.ShouldCompress(mimeType) && len(data) > cache.CompressionThreshold &&
+				(cacheKey != "" || (!upstreamGzip && AcceptsGzip(c.GetHeader("Accept-Encoding")))) {
+				compressedData, _ = cache.CompressData(data)
+			}
+
+			// Variable to store ETag if generated
+			var etag string
+
+			// Generate ETag if configured and add it to response headers
+			if cacheConfig != nil && cacheConfig.Enable && cacheConfig.ETagStrategy != "none" {
+				etag = generateETag(decodedContent, cacheConfig.ETagStrategy)
+				if etag != "" {
+					c.Writer.Header().Set("ETag", etag)
+				}
+
+				// Set Last-Modified header for cache validation
+				c.Writer.Header().Set("Last-Modified", renderedAt.Format(http.TimeFormat))
+			}
+
+			// Apply VaryByQueryParams if configured
+			if cacheConfig != nil && cacheConfig.Enable && len(cacheConfig.VaryByQueryParams) > 0 {
+				// Add Vary header for query parameters
+				// This is a custom implementation as HTTP doesn't directly support varying by query params
+				// We'll add a custom header to indicate which query params affect caching
+				c.Writer.Header().Set("X-Vary-By-Query-Params", strings.Join(cacheConfig.VaryByQueryParams, ", "))
+			}
+
+			// Prepare response headers
+			c.Writer.Header().Set("Content-Type", mimeType)
+			for hKey, hValue := range headers {
+				c.Writer.Header().Set(hKey, hValue)
+			}
+			if gzipEnabled {
+				c.Header("Vary", appendTemplateVary(c.Writer.Header().Get("Vary"), "Accept-Encoding"))
+			}
+			etag = c.Writer.Header().Get("ETag") // The cached validator identifies identity bytes.
+			responseHeaders := templateResponseHeaders(c, cacheConfig, headers)
+			localGzip := gzipEnabled && !upstreamGzip && len(compressedData) > 0 && AcceptsGzip(c.GetHeader("Accept-Encoding"))
+			if upstreamGzip || localGzip {
+				if etag != "" {
+					c.Header("ETag", GzipETag(etag))
+				}
+				if localGzip {
+					c.Header("Content-Encoding", "gzip")
+				}
+			}
+
+			if cacheKey != "" && c.Writer.Header().Get("Set-Cookie") == "" && !hasCacheDirective(c.Writer.Header().Get("Cache-Control"), "no-store") && !hasCacheDirective(c.Writer.Header().Get("Cache-Control"), "no-cache") && !hasCacheDirective(c.Writer.Header().Get("Cache-Control"), "private") {
+				expiryTime := renderedAt.Add(time.Duration(cacheConfig.InMemoryCacheTTL) * time.Second)
+				if cacheConfig.MaxAge > 0 {
+					maxAgeExpiry := renderedAt.Add(time.Duration(cacheConfig.MaxAge) * time.Second)
+					if maxAgeExpiry.Before(expiryTime) {
+						expiryTime = maxAgeExpiry
+					}
+				}
+				if cacheConfig.ExpiresAt != nil && cacheConfig.ExpiresAt.Before(expiryTime) {
+					expiryTime = *cacheConfig.ExpiresAt
+				}
+				fileCache.Set(cacheKey, &cache.CachedFile{
+					Data: data, GzipData: compressedData, ETag: etag, Modtime: renderedAt,
+					MimeType: mimeType, Size: len(data), Path: c.Request.URL.Path,
+					ExpiresAt: expiryTime, Headers: responseHeaders,
+				})
+			}
+
+			if (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) && etagMatches(c.GetHeader("If-None-Match"), c.Writer.Header().Get("ETag")) {
+				c.Header("X-Cache", "MISS")
+				c.AbortWithStatus(http.StatusNotModified)
+				return
+			}
+
+			// Set cache miss header for debugging
+			c.Writer.Header().Set("X-Cache", "MISS")
+
+			// Write status and flush headers
+			c.Writer.WriteHeader(http.StatusOK)
+			c.Writer.Flush()
+
+			// Render the content
+			if localGzip {
+				_, _ = c.Writer.Write(compressedData)
+			} else {
+				fmt.Fprint(c.Writer, decodedContent)
+			}
+			c.Writer.Flush()
+			c.Abort()
+
+		}
+	}
+}
+
+func Atob(data string) string {
+	decodedData, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		log.Printf("Atob failed: %v", err)
+		return ""
+	}
+	return string(decodedData)
+}
+
+// applyCacheHeaders applies cache control headers based on the provided CacheConfig
+func applyCacheHeaders(c *gin.Context, config *CacheConfig) {
+	if config == nil || !config.Enable {
+		return
+	}
+
+	// Build Cache-Control header
+	cacheControl := ""
+
+	// Handle no-store directive (highest priority, prevents caching)
+	if config.NoStore {
+		cacheControl = "no-store"
+		c.Header("Cache-Control", cacheControl)
+		return
+	}
+
+	// Handle no-cache directive
+	if config.NoCache {
+		cacheControl = "no-cache"
+	}
+
+	// Set privacy directive
+	if config.Private {
+		if len(cacheControl) > 0 {
+			cacheControl += ", "
+		}
+		cacheControl += "private"
+	} else {
+		if len(cacheControl) > 0 {
+			cacheControl += ", "
+		}
+		cacheControl += "public"
+	}
+
+	// Set max-age directive
+	if config.MaxAge > 0 {
+		if len(cacheControl) > 0 {
+			cacheControl += ", "
+		}
+		cacheControl += fmt.Sprintf("max-age=%d", config.MaxAge)
+	}
+
+	// Set must-revalidate directive
+	if config.Revalidate {
+		if len(cacheControl) > 0 {
+			cacheControl += ", "
+		}
+		cacheControl += "must-revalidate"
+	}
+
+	// Set stale-while-revalidate directive
+	if config.StaleWhileRevalidate > 0 {
+		if len(cacheControl) > 0 {
+			cacheControl += ", "
+		}
+		cacheControl += fmt.Sprintf("stale-while-revalidate=%d", config.StaleWhileRevalidate)
+	}
+
+	// Apply Cache-Control header
+	if len(cacheControl) > 0 {
+		c.Header("Cache-Control", cacheControl)
+	}
+
+	// Apply Expires header if configured
+	if config.ExpiresAt != nil {
+		c.Header("Expires", config.ExpiresAt.UTC().Format(http.TimeFormat))
+	} else if config.MaxAge > 0 {
+		// Set Expires based on max-age if ExpiresAt not explicitly set
+		expiresTime := time.Now().Add(time.Duration(config.MaxAge) * time.Second)
+		c.Header("Expires", expiresTime.UTC().Format(http.TimeFormat))
+	}
+
+	// Apply Vary header based on configuration
+	if len(config.VaryByHeaders) > 0 {
+		c.Header("Vary", strings.Join(config.VaryByHeaders, ", "))
+	}
+
+	// Apply custom headers
+	if config.CustomHeaders != nil {
+		for key, value := range config.CustomHeaders {
+			c.Header(key, value)
+		}
+	}
+}
+
+// generateETag generates an ETag for the response based on the configured strategy
+func generateETag(content string, strategy string) string {
+	if strategy == "none" {
+		return ""
+	}
+
+	// Create a hash of the content
+	hash := sha256.Sum256([]byte(content))
+	etag := hex.EncodeToString(hash[:8]) // Use first 8 bytes for brevity
+
+	if strategy == "weak" {
+		return fmt.Sprintf("W/\"%s\"", etag)
+	}
+
+	// Strong ETag
+	return fmt.Sprintf("\"%s\"", etag)
+}
+
+// templateResponseHeaders keeps only headers produced by the routed template.
+func templateResponseHeaders(c *gin.Context, config *CacheConfig, rendered map[string]string) map[string]string {
+	keys := map[string]bool{
+		"Cache-Control": true, "Expires": true, "Vary": true,
+		"ETag": true, "Last-Modified": true, "Content-Type": true,
+		"Content-Disposition": true, "X-Vary-By-Query-Params": true,
+	}
+	if config != nil {
+		for key := range config.CustomHeaders {
+			keys[http.CanonicalHeaderKey(key)] = true
+		}
+	}
+	for key := range rendered {
+		keys[http.CanonicalHeaderKey(key)] = true
+	}
+	for _, key := range []string{"Set-Cookie", "Date", "Age", "X-Cache", "Content-Length", "Transfer-Encoding", "Connection"} {
+		delete(keys, key)
+	}
+	result := make(map[string]string, len(keys))
+	for key := range keys {
+		if value := c.Writer.Header().Get(key); value != "" {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func serveCachedTemplate(c *gin.Context, cached *cache.CachedFile, gzipEnabled, upstreamGzip bool) {
+	for key, value := range cached.Headers {
+		c.Header(key, value)
+	}
+	c.Header("X-Cache", "HIT")
+	goAge := int(time.Since(cached.Modtime).Seconds())
+	if goAge < 0 {
+		goAge = 0
+	}
+	c.Header("Age", strconv.Itoa(goAge))
+
+	data := cached.Data
+	etag := cached.Headers["ETag"]
+	localGzip := gzipEnabled && !upstreamGzip && len(cached.GzipData) > 0 && AcceptsGzip(c.GetHeader("Accept-Encoding"))
+	if localGzip {
+		data = cached.GzipData
+		c.Header("Content-Encoding", "gzip")
+	}
+	if (upstreamGzip || localGzip) && etag != "" {
+		etag = GzipETag(etag)
+		c.Header("ETag", etag)
+	}
+	if etagMatches(c.GetHeader("If-None-Match"), etag) {
+		c.AbortWithStatus(http.StatusNotModified)
+		return
+	}
+	if c.GetHeader("If-None-Match") == "" {
+		if since, err := time.Parse(http.TimeFormat, c.GetHeader("If-Modified-Since")); err == nil && !cached.Modtime.Truncate(time.Second).After(since) {
+			c.AbortWithStatus(http.StatusNotModified)
+			return
+		}
+	}
+	c.Data(http.StatusOK, cached.Headers["Content-Type"], data)
+}
+
+func etagMatches(requestValue, current string) bool {
+	if requestValue == "" {
+		return false
+	}
+	for _, candidate := range strings.Split(requestValue, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" {
+			return true
+		}
+		if current != "" && strings.TrimPrefix(candidate, "W/") == strings.TrimPrefix(current, "W/") {
+			return true
+		}
+	}
+	return false
+}
+
+func appendTemplateVary(existing, name string) string {
+	for _, value := range strings.Split(existing, ",") {
+		if strings.EqualFold(strings.TrimSpace(value), name) {
+			return existing
+		}
+	}
+	if existing == "" {
+		return name
+	}
+	return existing + ", " + name
+}
+
+func hasCacheDirective(value, directive string) bool {
+	for _, field := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(field), directive) {
+			return true
+		}
+	}
+	return false
+}

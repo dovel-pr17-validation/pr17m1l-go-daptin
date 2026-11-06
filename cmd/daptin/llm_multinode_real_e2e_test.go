@@ -1,0 +1,285 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestLLMFileMetadataRealE2E(t *testing.T) {
+	requireRealE2E(t)
+	const schema = `Tables:
+  - TableName: document
+    Columns:
+      - Name: document_content
+        IsForeignKey: true
+        ForeignKeyData:
+          DataSource: cloud_store
+          Namespace: llm-file-e2e-store
+          KeyName: files
+`
+	usedPorts := map[int]bool{}
+	port := freeTransportE2EPort(t, usedPorts)
+	httpsPort := freeTransportE2EPort(t, usedPorts)
+	olricPort := freeTransportE2EPortPair(t, usedPorts)
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	options := transportE2EDaptinOptions{databaseType: "sqlite3", connectionString: filepath.Join(t.TempDir(), "llm-files.db"), olricPort: olricPort, schema: schema}
+	process := startTransportE2EDaptin(t, port, httpsPort, baseURL, options)
+	client := &http.Client{Timeout: 20 * time.Second}
+	token := accessGroupsE2ESignupSigninAdmin(t, client, baseURL)
+	accessGroupsE2ECreateRecord(t, client, baseURL, token, "cloud_store", map[string]interface{}{
+		"name": "llm-file-e2e-store", "store_type": "local", "store_provider": "local", "root_path": t.TempDir(), "store_parameters": "{}",
+	})
+	process.stopProcess()
+	process = startTransportE2EDaptin(t, port, httpsPort, baseURL, options)
+	defer process.stopProcess()
+	signin := accessGroupsE2ERequestJSON(t, client, http.MethodPost, baseURL+"/action/user_account/signin", "",
+		map[string]interface{}{"attributes": map[string]interface{}{"email": "admin@test.local", "password": "testpass123"}}, http.StatusOK)
+	token, _ = accessGroupsE2EFindString(signin, "value")
+
+	content := []byte("a real uploaded file\n")
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	if err := form.WriteField("purpose", "assistants"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := form.CreateFormFile("file", "notes.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := form.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upload := requestAssetE2E(t, client, http.MethodPost, baseURL+"/v1/files", token, &body, form.FormDataContentType(), http.StatusOK)
+	var created map[string]interface{}
+	if err := json.Unmarshal(upload, &created); err != nil {
+		t.Fatal(err)
+	}
+	id, ok := created["id"].(string)
+	if !ok || id == "" {
+		t.Fatalf("upload returned no file ID: %s", upload)
+	}
+	for _, path := range []string{"/v1/files", "/v1/files/" + id} {
+		metadata := requestAssetE2E(t, client, http.MethodGet, baseURL+path, token, nil, "", http.StatusOK)
+		var result map[string]interface{}
+		if err := json.Unmarshal(metadata, &result); err != nil {
+			t.Fatal(err)
+		}
+		if path == "/v1/files" {
+			files, ok := result["data"].([]interface{})
+			if !ok || len(files) != 1 {
+				t.Fatalf("file list = %s", metadata)
+			}
+			result, ok = files[0].(map[string]interface{})
+			if !ok {
+				t.Fatalf("file list entry = %s", metadata)
+			}
+		}
+		if result["id"] != id || result["bytes"] != float64(len(content)) || result["filename"] != "notes.txt" {
+			t.Fatalf("%s returned incorrect metadata: %s", path, metadata)
+		}
+	}
+}
+
+func TestLLMMultinodeCatalogConvergence(t *testing.T) {
+	if os.Getenv("DAPTIN_LLM_MULTINODE_E2E") != "1" {
+		t.Skip("set DAPTIN_LLM_MULTINODE_E2E=1 with DAPTIN_TEST_POSTGRES_DSN to run the LLM multi-node e2e")
+	}
+	dsn := os.Getenv("DAPTIN_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DAPTIN_TEST_POSTGRES_DSN must identify a disposable PostgreSQL database")
+	}
+
+	var expectedKey atomic.Value
+	expectedKey.Store("multinode-initial-key")
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/chat/completions" {
+			http.NotFound(response, request)
+			return
+		}
+		if request.Header.Get("Authorization") != "Bearer "+expectedKey.Load().(string) {
+			http.Error(response, "stale provider credential", http.StatusUnauthorized)
+			return
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body["model"] != "multinode-upstream" {
+			http.Error(response, "invalid upstream request", http.StatusBadRequest)
+			return
+		}
+		transportE2EWriteJSON(response, map[string]interface{}{
+			"id": "multinode-chat", "object": "chat.completion", "created": 1, "model": "multinode-upstream",
+			"choices": []interface{}{map[string]interface{}{
+				"index": 0, "message": map[string]interface{}{"role": "assistant", "content": "multinode-ok"}, "finish_reason": "stop",
+			}},
+			"usage": map[string]interface{}{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	}))
+	defer upstream.Close()
+
+	usedPorts := make(map[int]bool, 8)
+	portA := freeTransportE2EPort(t, usedPorts)
+	httpsPortA := freeTransportE2EPort(t, usedPorts)
+	portB := freeTransportE2EPort(t, usedPorts)
+	httpsPortB := freeTransportE2EPort(t, usedPorts)
+	olricPortA := freeTransportE2EPortPair(t, usedPorts)
+	olricPortB := freeTransportE2EPortPair(t, usedPorts)
+	baseA := fmt.Sprintf("http://127.0.0.1:%d", portA)
+	baseB := fmt.Sprintf("http://127.0.0.1:%d", portB)
+
+	processA := startTransportE2EDaptin(t, portA, httpsPortA, baseA, transportE2EDaptinOptions{
+		databaseType: "postgres", connectionString: dsn, olricPort: olricPortA,
+	})
+	defer processA.stopProcess()
+	client := &http.Client{Timeout: 20 * time.Second}
+	token := transportE2ESignupSigninAdmin(t, client, baseA)
+	statsA := transportE2EGetJSON(t, client, baseA+"/statistics", token)
+	memberA, ok := transportE2EPath(statsA, "olric.member")
+	if !ok {
+		t.Fatalf("first server has no Olric member: %#v", statsA)
+	}
+	host, port, err := net.SplitHostPort(memberA.(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	membershipPort, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processB := startTransportE2EDaptin(t, portB, httpsPortB, baseB, transportE2EDaptinOptions{
+		databaseType: "postgres", connectionString: dsn, olricPort: olricPortB,
+		olricPeers: net.JoinHostPort(host, strconv.Itoa(membershipPort+1)),
+	})
+	defer processB.stopProcess()
+
+	waitForLLME2ECluster(t, client, baseA, baseB, token)
+	credentialReference := createLLME2ECatalog(t, client, baseA, token, llmE2ECatalog{
+		name: "llm-multinode-e2e", upstreamURL: upstream.URL, apiKey: "multinode-initial-key",
+		upstreamModel: "multinode-upstream", operations: []string{"chat"}, maxConcurrency: 4,
+	})
+	waitForLLME2EModel(t, client, baseA, token, "llm-multinode-e2e")
+	waitForLLME2EModel(t, client, baseB, token, "llm-multinode-e2e")
+
+	assertTransportE2EString(t, invokeLLMMultinodeChat(t, client, baseA, token), "choices.0.message.content", "multinode-ok")
+	assertTransportE2EString(t, invokeLLMMultinodeChat(t, client, baseB, token), "choices.0.message.content", "multinode-ok")
+	assertTransportE2EString(t, invokeLLMMultinodeChat(t, client, baseA, token), "choices.0.message.content", "multinode-ok")
+
+	rotatedKey := "multinode-rotated-key"
+	patchBody, err := json.Marshal(map[string]interface{}{
+		"data": map[string]interface{}{
+			"type": "credential", "id": credentialReference,
+			"attributes": map[string]interface{}{"content": `{"api_key":"` + rotatedKey + `"}`},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchRequest, err := http.NewRequest(http.MethodPatch, baseA+"/api/credential/"+credentialReference, bytes.NewReader(patchBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchRequest.Header.Set("Authorization", "Bearer "+token)
+	patchRequest.Header.Set("Content-Type", "application/vnd.api+json")
+	transportE2EDoJSON(t, client, patchRequest)
+	expectedKey.Store(rotatedKey)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, status := tryLLMMultinodeChat(client, baseB, token)
+		if status == http.StatusOK {
+			assertTransportE2EString(t, response, "choices.0.message.content", "multinode-ok")
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("second Daptin process did not converge after credential rotation: status=%d response=%#v", status, response)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func waitForLLME2ECluster(t *testing.T, client *http.Client, baseA, baseB, token string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		statsA := transportE2EGetJSON(t, client, baseA+"/statistics", token)
+		statsB := transportE2EGetJSON(t, client, baseB+"/statistics", token)
+		memberA, _ := transportE2EPath(statsA, "olric.member")
+		memberB, _ := transportE2EPath(statsB, "olric.member")
+		countA, _ := transportE2EPath(statsA, "olric.member_count")
+		countB, _ := transportE2EPath(statsB, "olric.member_count")
+		membersA, _ := transportE2EPath(statsA, "olric.members")
+		membersB, _ := transportE2EPath(statsB, "olric.members")
+		if memberA != memberB && countA == float64(2) && countB == float64(2) && reflect.DeepEqual(membersA, membersB) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Daptin servers did not join one Olric cluster: A=%#v B=%#v", statsA, statsB)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func waitForLLME2EModel(t testing.TB, client *http.Client, baseURL string, token string, modelName string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		models := transportE2EGetJSON(t, client, baseURL+"/v1/models", token)
+		if data, ok := transportE2EPath(models, "data"); ok {
+			if entries, valid := data.([]interface{}); valid {
+				for _, entry := range entries {
+					if id, present := transportE2EPath(entry, "id"); present && id == modelName {
+						return
+					}
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Daptin process at %s did not converge on the LLM model: %#v", baseURL, models)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func invokeLLMMultinodeChat(t *testing.T, client *http.Client, baseURL string, token string) interface{} {
+	t.Helper()
+	response, status := tryLLMMultinodeChat(client, baseURL, token)
+	if status != http.StatusOK {
+		t.Fatalf("LLM chat at %s returned %d: %#v", baseURL, status, response)
+	}
+	return response
+}
+
+func tryLLMMultinodeChat(client *http.Client, baseURL string, token string) (interface{}, int) {
+	body := bytes.NewBufferString(`{"model":"llm-multinode-e2e","messages":[{"role":"user","content":"hello"}]}`)
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions", body)
+	if err != nil {
+		return map[string]interface{}{"request_error": err.Error()}, 0
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return map[string]interface{}{"request_error": err.Error()}, 0
+	}
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(response.Body)
+	var decoded interface{}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		decoded = map[string]interface{}{"body": string(payload)}
+	}
+	return decoded, response.StatusCode
+}

@@ -1,0 +1,15 @@
+{
+  "data": {
+    "type": "property",
+    "id": "daea7bb9-c895-422a-a1f9-63abe9536c91",
+    "attributes": {
+      "usergroup_id": [
+        {
+          "type": "usergroup",
+          "id": "ee7a3f5c-3a03-424c-92dc-7e3a33fb237f",
+          "name": "yolo group"
+        }
+      ]
+    }
+  }
+}

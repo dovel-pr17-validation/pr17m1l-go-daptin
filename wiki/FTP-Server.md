@@ -1,0 +1,626 @@
+# FTP Server
+
+FTP file operations use the site's configured cloud store. A successful FTP
+upload means the local or rclone-backed store accepted the file; a failed store
+write returns an FTP error.
+
+Host site files via FTP/FTPS with site-based access control and automatic TLS encryption.
+
+## Overview
+
+Daptin includes an FTP/FTPS server that provides file access to subsites. Features:
+
+- **Permission-aware site access**: Users see only FTP-enabled sites allowed by the site's Daptin permissions
+- **Daptin authentication**: Login with your Daptin username (email) and password
+- **Automatic FTPS/TLS**: Encryption enabled automatically using site certificates
+- **Stored file operations**: Upload, download, delete, and rename files in the site's configured storage
+- **Default port**: 2121
+
+The FTP server waits for the backing-store write before completing an upload;
+if the store rejects it, the client must retry.
+
+FTP operations are not JSON:API resource mutations and do not trigger
+`data_exchange` lifecycle hooks. See [[Data-Exchange|Data Exchange]].
+
+## Prerequisites
+
+Before using FTP, you must have:
+
+1. **Cloud storage configured** - See [[Cloud-Storage|Cloud Storage]]
+2. **At least one site with FTP enabled** - See [[Subsites|Subsites]]
+3. **FTP enabled in configuration** - Set `ftp.enable` to `true`
+
+## Quick Start
+
+### Step 1: Enable FTP Server
+
+FTP is disabled by default. Enable it via the configuration:
+
+```bash
+TOKEN=$(cat /tmp/daptin-token.txt)
+
+# Configuration string values are sent as raw text, not JSON strings.
+curl -X POST http://localhost:6336/_config/backend/ftp.enable \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: text/plain' \
+  --data-binary 'true'
+```
+
+### Step 2: Configure the CLI and Create a Cloud Store
+
+```bash
+# Sign in with daptin-cli first
+daptin-cli context add local http://localhost:6336
+daptin-cli context set local
+daptin-cli execute user_account signin email=admin@example.com password='your-password'
+
+# Create storage directory
+mkdir -p /tmp/ftp-storage
+
+# Create cloud_store
+daptin-cli storage add ftp-storage \
+  --type local \
+  --store-provider local \
+  --root-path /tmp/ftp-storage
+
+STORE_ID=$(daptin-cli -q list cloud_store --filter name=ftp-storage --page-size 1 | tail -1)
+```
+
+### Step 3: Create Site with FTP Enabled
+
+```bash
+# Create site directory
+mkdir -p /tmp/ftp-storage/mysite
+
+# Create site with ftp_enabled=true
+daptin-cli create site \
+  name=my-ftp-site \
+  hostname=ftp.example.com \
+  path=mysite \
+  enable=true \
+  ftp_enabled=true \
+  site_type=static \
+  cloud_store_id="$STORE_ID"
+
+SITE_ID=$(daptin-cli -q list site --filter hostname=ftp.example.com --page-size 1 | tail -1)
+
+# Owner-only Peek/Read/Create/Update/Delete. The CLI prints 3968.
+daptin-cli permission encode \
+  +OwnerPeek +OwnerRead +OwnerCreate +OwnerUpdate +OwnerDelete
+daptin-cli update site "$SITE_ID" permission=3968
+```
+
+To share the site with a usergroup, relate the site to that group and configure the relationship permission with the required `Group*` bits. FTP evaluates the existing `PermissionInstance` owner and relationship permissions; it does not maintain a separate FTP ACL.
+
+### Step 4: Restart Server
+
+**CRITICAL**: FTP server only starts if sites with `ftp_enabled=true` exist.
+
+```bash
+./scripts/testing/test-runner.sh stop
+./scripts/testing/test-runner.sh start
+
+# Verify FTP is listening
+lsof -i :2121
+```
+
+### Step 5: Connect via FTP
+
+**Using Command Line FTP** (if available):
+```bash
+ftp localhost 2121
+# Username: admin@admin.com
+# Password: adminadmin
+```
+
+**Using Python**:
+```python
+from ftplib import FTP
+
+ftp = FTP()
+ftp.connect('localhost', 2121)
+ftp.login('admin@admin.com', 'adminadmin')
+
+# Navigate to your site
+ftp.cwd('/ftp.example.com')
+
+# Upload file
+with open('local.txt', 'rb') as f:
+    ftp.storbinary('STOR remote.txt', f)
+
+# Download file
+with open('downloaded.txt', 'wb') as f:
+    ftp.retrbinary('RETR remote.txt', f.write)
+
+ftp.quit()
+```
+
+**Using FTPS (TLS)**:
+```python
+from ftplib import FTP_TLS
+
+ftps = FTP_TLS()
+ftps.connect('localhost', 2121)
+ftps.auth()  # Enable TLS
+ftps.login('admin@admin.com', 'adminadmin')
+ftps.prot_p()  # Secure data connection
+
+ftps.cwd('/ftp.example.com')
+# ... file operations ...
+
+ftps.quit()
+```
+
+---
+
+## Configuration
+
+### FTP Settings
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `ftp.enable` | Enable/disable FTP server | `false` |
+| `ftp.listen_interface` | Interface and port to listen on | `0.0.0.0:2121` |
+
+**Set through the configuration authority**:
+```bash
+curl -X POST http://localhost:6336/_config/backend/ftp.listen_interface \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: text/plain' \
+  --data-binary '0.0.0.0:2121'
+```
+
+Posting `"0.0.0.0:2121"` as a JSON string stores the quote characters and
+can make startup fail with an invalid-port lookup. Restart Daptin
+with its process supervisor after changing listener configuration.
+
+### Site Configuration
+
+To enable FTP for a site, set `ftp_enabled: true` when creating or updating the site:
+
+```bash
+curl -X PATCH "http://localhost:6336/api/site/$SITE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "site",
+      "id": "'$SITE_ID'",
+      "attributes": {
+        "ftp_enabled": true
+      }
+    }
+  }'
+```
+
+**After changing FTP settings**: Restart the server for changes to take effect.
+
+---
+
+## Directory Structure
+
+### Root Directory
+
+When you connect to FTP, the root directory (`/`) lists only FTP-enabled sites for which the user has `Peek` permission:
+
+```
+/
+├── site1.example.com/
+├── site2.example.com/
+└── site3.example.com/
+```
+
+### Site Directories
+
+Each site directory maps to the site's cloud storage path:
+
+```
+{cloud_store.root_path}/{site.path}/
+```
+
+**Example**:
+- `cloud_store.root_path`: `/tmp/ftp-storage`
+- `site.path`: `mysite`
+- FTP path: `/site.hostname/`
+- Actual files: `/tmp/ftp-storage/mysite/`
+
+---
+
+## File Operations
+
+### Upload File
+
+```python
+from ftplib import FTP
+
+ftp = FTP()
+ftp.connect('localhost', 2121)
+ftp.login('admin@admin.com', 'adminadmin')
+ftp.cwd('/ftp.example.com')
+
+# Binary mode upload
+with open('image.jpg', 'rb') as f:
+    ftp.storbinary('STOR image.jpg', f)
+
+# Text mode upload
+with open('index.html', 'r') as f:
+    ftp.storlines('STOR index.html', f)
+
+ftp.quit()
+```
+
+### Download File
+
+```python
+from ftplib import FTP
+
+ftp = FTP()
+ftp.connect('localhost', 2121)
+ftp.login('admin@admin.com', 'adminadmin')
+ftp.cwd('/ftp.example.com')
+
+# Binary mode download
+with open('downloaded.jpg', 'wb') as f:
+    ftp.retrbinary('RETR image.jpg', f.write)
+
+# Text mode download
+lines = []
+ftp.retrlines('RETR index.html', lines.append)
+content = '\n'.join(lines)
+
+ftp.quit()
+```
+
+### Delete File
+
+```python
+ftp.delete('oldfile.txt')
+```
+
+### Create Directory
+
+```python
+# Create directory in site
+ftp.cwd('/ftp.example.com')
+ftp.mkd('uploads')
+
+# Upload to subdirectory
+with open('file.txt', 'rb') as f:
+    ftp.storbinary('STOR uploads/file.txt', f)
+```
+
+**Note**: Cannot create directories in root (`/`); sites must be created via API.
+An object store that cannot retain empty directories (including S3-compatible
+stores) rejects `MKD`. Uploading `uploads/file.txt` can still create that
+prefix as part of the stored object's path.
+
+---
+
+## Authentication
+
+### User Authentication
+
+FTP uses Daptin user accounts for authentication:
+
+- **Username**: User's email address (e.g., `admin@admin.com`)
+- **Password**: User's Daptin password
+
+### Permission Model
+
+Users can access FTP if:
+1. They have valid Daptin credentials
+2. At least one FTP-enabled site exists
+3. They have the required permission on the site through ownership, a related usergroup, or the administrator group
+
+FTP uses the existing `PermissionInstance` methods:
+
+| FTP operation | Site permission |
+|---------------|-----------------|
+| Show a site in `/`, change into it | `Peek` |
+| List files, inspect metadata, download | `Read` |
+| Upload a new file, create a directory | `Create` |
+| Overwrite, append, chmod, change mtime | `Update` |
+| Rename | `Read` and `Update` |
+| Delete a file or directory | `Delete` |
+
+The permission may be an `Owner*` bit for the site's owner or a `Group*` bit on a site-usergroup relationship for a member of that group. Members of the administrator group are accepted by the existing permission methods. Unknown and unauthorized sites are intentionally reported in the same way.
+
+Site and relationship permissions are loaded when the FTP server starts. Restart Daptin after changing `ftp_enabled`, site permissions, site-usergroup relationships, or FTP configuration.
+
+---
+
+## TLS/FTPS Support
+
+FTPS (FTP with TLS) is automatically enabled using the site's certificate.
+
+### Connect with FTPS
+
+```python
+from ftplib import FTP_TLS
+import ssl
+
+ftps = FTP_TLS()
+
+# Connect and enable TLS
+ftps.connect('localhost', 2121)
+ftps.auth()  # Negotiate TLS
+ftps.login('admin@admin.com', 'adminadmin')
+
+# Secure data connection
+ftps.prot_p()
+
+# ... operations ...
+
+ftps.quit()
+```
+
+### Certificate Management
+
+Daptin automatically retrieves or generates certificates for FTP-enabled sites:
+
+1. On first FTP connection, looks up certificate for site's hostname
+2. If no certificate exists, generates a self-signed certificate
+3. For production, configure ACME/Let's Encrypt certificates via [[TLS-Certificates|TLS Certificates]]
+
+**Self-signed certificates**: FTP clients may show warnings. Either:
+- Accept the certificate (for testing)
+- Configure proper TLS certificates (for production)
+- Disable TLS verification in client (not recommended)
+
+---
+
+## Use Cases
+
+### 1. Legacy Application Integration
+
+Connect legacy applications that only support FTP:
+
+```bash
+# Configure FTP client in legacy app
+Host: your-daptin-server.com
+Port: 2121
+Username: app-user@example.com
+Password: <app-password>
+Directory: /app-files.example.com
+```
+
+### 2. File Management GUI
+
+Use FTP clients like FileZilla for visual file management:
+
+1. Open FileZilla
+2. Protocol: FTP with explicit TLS (FTPS), Host: `your-server.com`, Port: `2121`
+3. Username: your Daptin email
+4. Password: your Daptin password
+5. Browse and manage site files visually
+
+### 3. Automated Deployments
+
+Deploy static sites via FTP:
+
+```python
+import ftplib
+import os
+
+def deploy_site(local_dir, ftp_host, ftp_site, user, password):
+    ftp = ftplib.FTP()
+    ftp.connect(ftp_host, 2121)
+    ftp.login(user, password)
+    ftp.cwd(f'/{ftp_site}')
+
+    for root, dirs, files in os.walk(local_dir):
+        # Create directories
+        for dir in dirs:
+            rel_path = os.path.relpath(os.path.join(root, dir), local_dir)
+            try:
+                ftp.mkd(rel_path)
+            except:
+                pass  # Directory might exist
+
+        # Upload files
+        for file in files:
+            local_path = os.path.join(root, file)
+            remote_path = os.path.relpath(local_path, local_dir)
+            with open(local_path, 'rb') as f:
+                ftp.storbinary(f'STOR {remote_path}', f)
+
+    ftp.quit()
+
+# Deploy
+deploy_site('./build', 'localhost', 'my-site.com', 'admin@admin.com', 'adminadmin')
+```
+
+---
+
+## Troubleshooting
+
+### FTP Server Not Starting
+
+**Symptom**: Port 2121 not listening, no "FTP server started" log message.
+
+**Causes**:
+1. `ftp.enable` is not set to `"true"`
+2. No sites with `ftp_enabled=true` exist
+3. Site directory doesn't exist in cloud storage
+
+**Solutions**:
+
+```bash
+# Check ftp.enable through the configuration authority
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  http://localhost:6336/_config/backend/ftp.enable
+# Expected stored text: true
+
+# Check for FTP-enabled sites through the resource API
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  'http://localhost:6336/api/site?page[size]=100' | \
+  jq '.data[] | select(.attributes.ftp_enabled == true or .attributes.ftp_enabled == "1") | {name:.attributes.name, hostname:.attributes.hostname}'
+
+# Create site directory
+mkdir -p /path/to/cloud_store/site_path/
+
+# Restart server
+./scripts/testing/test-runner.sh stop && ./scripts/testing/test-runner.sh start
+
+# Verify FTP port
+lsof -i :2121
+```
+
+### Cannot Connect to FTP
+
+**Symptom**: Connection refused or timeout.
+
+**Check firewall**:
+```bash
+# Verify port is listening
+lsof -i :2121
+
+# Check if accessible externally (replace with your IP)
+telnet your-server-ip 2121
+```
+
+**Check FTP interface**:
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  http://localhost:6336/_config/backend/ftp.listen_interface
+# Default: 0.0.0.0:2121 (all interfaces)
+# Change to specific IP if needed
+```
+
+### Authentication Failed
+
+**Symptom**: "Login incorrect" or "530 Authentication failed".
+
+**Verify credentials**:
+```bash
+# Test the same credentials through Daptin's authentication action
+curl -X POST http://localhost:6336/action/user_account/signin \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":{"email":"admin@admin.com","password":"adminadmin"}}'
+```
+
+### Empty Directory Listing
+
+**Symptom**: FTP LIST command shows empty directory, but files exist.
+
+An empty root means the authenticated user has no `Peek` permission on any FTP-enabled site. A site listing reads the configured backing store; if it is unexpectedly empty, check that site's storage path and credentials. Do not grant broad permissions merely to make a site appear.
+
+### Cannot Create Directory in Root
+
+**Symptom**: Error when trying `mkd` in `/`.
+
+**This is by design**. Root directory shows sites only. Create directories inside sites:
+
+```python
+# Wrong - fails
+ftp.cwd('/')
+ftp.mkd('newsite')  # Error
+
+# Right - works
+ftp.cwd('/existing-site.com')
+ftp.mkd('uploads')  # Succeeds when the backing store supports empty directories
+```
+
+### FTPS Certificate Warnings
+
+**Symptom**: FTP client shows "Certificate not trusted" warning.
+
+**For testing**: Accept the certificate or disable verification:
+
+```python
+import ssl
+ftps.ssl_version = ssl.PROTOCOL_TLSv1_2
+# In production: configure proper certificates
+```
+
+**For production**: Configure ACME certificates:
+```bash
+curl -X POST http://localhost:6336/action/world/acme.tls.generate \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"attributes":{"domain":"ftp.example.com","email":"admin@example.com"}}'
+```
+
+---
+
+## Security Considerations
+
+### Access Control
+
+- FTP uses the same owner, related-usergroup, and administrator checks as Daptin resources.
+- Grant the minimum `Peek`, `Read`, `Create`, `Update`, and `Delete` bits required for each site.
+- A valid account without permission cannot discover the site hostname or access it by an absolute FTP path.
+- Paths are confined to the selected site's configured storage root. Parent traversal, symlink escape, cross-site rename, and site-root delete/rename are rejected.
+- Keep `ftp.enable=false` when FTP is unused. Bind `ftp.listen_interface` to a private interface or restrict it with a firewall.
+- Restart Daptin after permission or site relationship changes so the FTP site snapshot is refreshed.
+
+### TLS Encryption
+
+- **Always use FTPS in production** to encrypt credentials and file transfers
+- Configure proper TLS certificates via ACME for trusted connections
+- Self-signed certificates provide encryption but not identity verification
+
+### Port Exposure
+
+- Default port 2121 is non-standard (FTP normally uses 21)
+- Configure firewall to restrict FTP access:
+  - Allow only from known IPs, OR
+  - Use VPN for FTP access, OR
+  - Use SSH tunneling: `ssh -L 2121:localhost:2121 user@server`
+
+### Password Security
+
+- Plain FTP sends credentials during authentication
+- Use strong passwords for Daptin accounts
+- Consider using dedicated service accounts with limited permissions
+- Rotate passwords periodically
+
+---
+
+## Performance
+
+### File Upload Speed
+
+FTP performance depends on:
+- Network bandwidth between client and server
+- Disk I/O speed of cloud storage
+- File size (larger files = better throughput)
+
+### Concurrent Connections
+
+Default maximum: 100 concurrent FTP connections.
+
+There is currently no runtime setting to change this limit.
+
+### Passive Mode Ports
+
+FTP uses dynamic passive ports for data transfer. Ensure firewall allows these connections.
+
+Daptin does not currently expose a passive-port-range setting. Verify the
+data ports used by your deployment before restricting them in a firewall.
+
+---
+
+## Limitations
+
+| Feature | Supported | Notes |
+|---------|-----------|-------|
+| Upload files | ✅ | All file types |
+| Download files | ✅ | All file types |
+| Delete files | ✅ | |
+| Create directories | ⚠️ | Within sites, when the storage backend preserves empty directories |
+| Directory listings | ✅ | Lists the configured backing store |
+| Rename files | ✅ | |
+| File permissions (chmod) | ⚠️ | Local storage only |
+| Symbolic links | ❌ | Not supported |
+| Resume transfers | ✅ | `REST` with `STOR`/`RETR`; append is also supported |
+| Site creation via FTP | ❌ | Must use API |
+| ASCII mode | ⚠️ | Not fully supported (use binary) |
+
+---
+
+## See Also
+
+- [[Subsites|Subsites]] - Static site hosting (required for FTP)
+- [[Cloud-Storage|Cloud Storage]] - Storage configuration (required for FTP)
+- [[TLS-Certificates|TLS Certificates]] - ACME/Let's Encrypt setup for FTPS
+- [[Authentication|Authentication]] - User authentication details

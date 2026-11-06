@@ -1,0 +1,194 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release, for example v0.12.27
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      GO111MODULE: on
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag="$(git describe --tags --match 'v*' --abbrev=0 "${RELEASE_TAG}^")"
+          {
+            echo "## Changes since ${previous_tag}"
+            echo
+            git log --reverse \
+              --format="- %s ([%h](https://github.com/${GITHUB_REPOSITORY}/commit/%H))" \
+              "${previous_tag}..${RELEASE_TAG}"
+          } > release-notes.md
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install release tools
+        run: |
+          go install github.com/GeertJohan/go.rice/rice@v1.0.3
+          go install github.com/crazy-max/xgo@v0.41.0
+          go install github.com/ahmetb/govvv@v0.3.0
+
+      - name: Build dashboard assets
+        run: |
+          wget -q https://github.com/artpar/dashboard3/releases/latest/download/shadcn-admin.zip
+          unzip -q shadcn-admin.zip -d daptinweb
+          rm shadcn-admin.zip
+          (cd cmd/daptin && "$(go env GOPATH)/bin/rice" embed-go)
+
+      - name: Cross-compile daptin
+        shell: bash
+        run: |
+          release_ldflags="-linkmode external -s -w $("$(go env GOPATH)/bin/govvv" -flags -version "${RELEASE_TAG}")"
+          "$(go env GOPATH)/bin/xgo" -go 1.25.x -targets=linux/amd64,linux/arm64,linux/arm-7 \
+            --tags netgo -ldflags "${release_ldflags}" -dest build -pkg cmd/daptin -out daptin .
+          "$(go env GOPATH)/bin/xgo" -go 1.25.x -targets=darwin/amd64,darwin/arm64,windows/amd64 \
+            --tags netgo -ldflags "${release_ldflags}" -dest build -pkg cmd/daptin -out daptin .
+
+      - name: Verify binaries
+        run: |
+          find build -maxdepth 1 -type f -print -exec file {} \;
+          test "$(find build -maxdepth 1 -type f -name 'daptin-*' | wc -l)" -eq 6
+          file build/daptin-linux-amd64 | grep -q 'x86-64'
+          file build/daptin-linux-arm64 | grep -q 'ARM aarch64'
+          file build/daptin-linux-arm-7 | grep -q 'ARM'
+          file build/daptin-darwin-amd64 | grep -q 'Mach-O 64-bit x86_64'
+          file build/daptin-darwin-arm64 | grep -q 'Mach-O 64-bit arm64'
+          file build/daptin-windows-amd64.exe | grep -q 'PE32+.*x86-64'
+          build/daptin-linux-amd64 -help >/dev/null
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist package
+
+          package_tarball() {
+            local platform="$1"
+            local architecture="$2"
+            rm -rf package/*
+            install -m 0755 "build/daptin-${platform}-${architecture}" package/daptin
+            cp README.md LICENSE package/
+            tar -C package -czf "dist/daptin-${RELEASE_TAG}-${platform}-${architecture}.tar.gz" .
+          }
+
+          package_tarball linux amd64
+          package_tarball linux arm64
+          package_tarball linux arm-7
+          package_tarball darwin amd64
+          package_tarball darwin arm64
+
+          rm -rf package/*
+          install -m 0755 build/daptin-windows-amd64.exe package/daptin.exe
+          cp README.md LICENSE package/
+          (cd package && zip -q -9 -r "../dist/daptin-${RELEASE_TAG}-windows-amd64.zip" .)
+
+          (cd dist && sha256sum daptin-* > daptin-${RELEASE_TAG}-checksums.txt)
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 7
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: daptin-${{ env.RELEASE_TAG }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          files: dist/*
+
+      - name: Prepare Docker tags
+        shell: bash
+        run: |
+          {
+            echo 'DOCKER_TAGS<<EOF'
+            echo "daptin/daptin:${RELEASE_TAG}"
+            if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo 'daptin/daptin:master'
+              echo 'daptin/daptin:latest'
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push multi-platform Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.DOCKER_TAGS }}
+          build-args: |
+            VERSION=${{ env.RELEASE_TAG }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      - name: Verify published image platforms
+        run: docker buildx imagetools inspect "daptin/daptin:${RELEASE_TAG}"

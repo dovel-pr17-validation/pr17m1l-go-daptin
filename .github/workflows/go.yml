@@ -1,0 +1,62 @@
+name: build
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GO111MODULE: on
+      GOTAGS: cmount
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+          cache: true
+
+      - name: Install system libraries
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+          sudo chown root:$USER /etc/fuse.conf
+          sudo apt-get update
+          sudo apt-get install -y fuse libfuse-dev pkg-config
+
+      - name: Install build tools
+        run: |
+          go install github.com/ahmetb/govvv@latest
+
+      - name: Print build environment
+        run: |
+          printf "Go version: $(go version)\n"
+          make vars
+
+      - name: Run quick tests
+        run: |
+          make
+          make quicktest
+
+      - name: Run three-node cluster smoke test
+        run: make test-e2e-smoke
+
+      - name: Compile live provider certification
+        run: go test -tags 'cmount live' -run '^$' ./...

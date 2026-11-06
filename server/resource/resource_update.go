@@ -1,0 +1,1436 @@
+package resource
+
+import (
+	"github.com/daptin/daptin/server/actionresponse"
+	daptinid "github.com/daptin/daptin/server/id"
+	jwtmiddleware "github.com/daptin/daptin/server/jwt"
+	"github.com/jmoiron/sqlx"
+	"strings"
+
+	"github.com/artpar/api2go/v2"
+	fieldtypes "github.com/daptin/daptin/server/columntypes"
+	"github.com/daptin/daptin/server/statementbuilder"
+	"github.com/doug-martin/goqu/v9"
+	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
+
+	//"reflect"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"time"
+
+	"github.com/daptin/daptin/server/auth"
+)
+
+var ErrVersionConflict = errors.New("resource version conflict")
+
+type versionConflictError string
+
+func (err versionConflictError) Error() string { return string(err) }
+
+func (versionConflictError) Is(target error) bool { return target == ErrVersionConflict }
+
+// Update an object
+// Possible Responder status codes are:
+// - 200 OK: Update successful, however some field(s) were changed, returns updates source
+// - 202 Accepted: Processing is delayed, return nothing
+// - 204 No Content: Update was successful, no fields were changed by the server, return nothing
+func (dbResource *DbResource) UpdateWithoutFilters(obj interface{}, req api2go.Request, updateTransaction *sqlx.Tx) (result map[string]interface{}, err error) {
+	return dbResource.updateWithoutFilters(obj, req, updateTransaction, func(namespace string, referenceID daptinid.DaptinReferenceId) bool {
+		permission := GetObjectPermissionByReferenceIdWithTransaction(namespace, referenceID, updateTransaction)
+		user, _ := req.PlainRequest.Context().Value("user").(*auth.SessionUser)
+		if user == nil {
+			user = &auth.SessionUser{}
+		}
+		return IsAdminWithTransaction(user, updateTransaction) ||
+			permission.CanRefer(user.UserReferenceId, user.Groups, dbResource.AdministratorGroupId)
+	})
+}
+
+func (dbResource *DbResource) updateWithoutFiltersAfterAuthorization(obj interface{}, req api2go.Request,
+	updateTransaction *sqlx.Tx) (map[string]interface{}, error) {
+	return dbResource.updateWithoutFilters(obj, req, updateTransaction,
+		func(string, daptinid.DaptinReferenceId) bool { return true })
+}
+
+func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.Request, updateTransaction *sqlx.Tx,
+	canRefer func(string, daptinid.DaptinReferenceId) bool) (result map[string]interface{}, err error) {
+	defer func() {
+		if err != nil {
+			err = normalizeDatabaseConstraintError(err)
+		}
+	}()
+
+	data, ok := obj.(api2go.Api2GoModel)
+
+	if !ok {
+		log.Errorf("Request data is not api2go model: %v", data)
+		return nil, errors.New("invalid request")
+	}
+
+	updateObjectReferenceId := uuid.MustParse(data.GetID())
+
+	idInt := data.GetColumnOriginalValue("id")
+
+	if idInt == nil {
+		idInt, err = GetReferenceIdToIdWithTransaction(dbResource.model.GetName(), daptinid.DaptinReferenceId(updateObjectReferenceId), updateTransaction)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	attrs := data.GetAllAsAttributes()
+
+	if !data.HasVersion() {
+		originalData, err := dbResource.GetReferenceIdToObjectWithTransaction(dbResource.model.GetTableName(),
+			daptinid.DaptinReferenceId(updateObjectReferenceId), updateTransaction)
+		if err != nil {
+			return nil, err
+		}
+		data = api2go.NewApi2GoModelWithData(dbResource.model.GetTableName(), nil, 0, nil, originalData)
+		data.SetAttributes(attrs)
+	}
+
+	allChanges := data.GetChanges()
+	if err := dbResource.prepareRelationshipReplacements(&data, allChanges, idInt, updateTransaction); err != nil {
+		return nil, err
+	}
+	allColumns := dbResource.model.GetColumns()
+	//log.Printf("Update object request with changes: %v", allChanges)
+
+	//dataToInsert := make(map[string]interface{})
+
+	languagePreferences := make([]string, 0)
+	if dbResource.tableInfo.TranslationsEnabled {
+		prefs := req.PlainRequest.Context().Value("language_preference")
+		if prefs != nil {
+			languagePreferences = prefs.([]string)
+		}
+	}
+
+	var colsList []string
+	var valsList []interface{}
+	passwordChanged := false
+	if len(allChanges) > 0 {
+		for _, col := range allColumns {
+
+			//log.Printf("Add column: %v", col.ColumnName)
+			if col.IsAutoIncrement {
+				continue
+			}
+
+			if col.ColumnName == "created_at" {
+				continue
+			}
+
+			if col.ColumnName == "reference_id" {
+				continue
+			}
+
+			if col.ColumnName == "updated_at" {
+				continue
+			}
+
+			if col.ColumnName == "version" {
+				continue
+			}
+
+			if col.ColumnName == auth.AuthVersionColumn {
+				continue
+			}
+
+			change, ok := allChanges[col.ColumnName]
+			if !ok {
+				continue
+			}
+
+			//log.Printf("Check column: [%v]  (%v) => (%v) ", col.ColumnName, change.OldValue, change.NewValue)
+
+			var val interface{}
+			val = change.NewValue
+			if col.IsForeignKey {
+
+				//log.Printf("Convert ref id to id %v[%v]", col.ForeignKeyData.Namespace, val)
+
+				switch col.ForeignKeyData.DataSource {
+				case "self":
+					if val != nil && val != "" {
+
+						valAsDir := daptinid.InterfaceToDIR(val)
+
+						foreignObjectId, err := GetReferenceIdToIdWithTransaction(col.ForeignKeyData.Namespace, valAsDir, updateTransaction)
+						if err != nil {
+							return nil, err
+						}
+
+						if canRefer(col.ForeignKeyData.Namespace, valAsDir) {
+							val = foreignObjectId
+						} else {
+							return nil, errors.New(fmt.Sprintf("no refer permission on object [%v][%v]", col.ForeignKeyData.Namespace, valAsDir))
+						}
+					} else {
+						ok = true
+					}
+
+				case "cloud_store":
+
+					if val == nil {
+						ok = false
+						continue
+					}
+
+					uploadActionPerformer, _ := GetGlobalActionHandler("cloudstore.file.upload")
+
+					files, ok := val.([]interface{})
+					if !ok {
+						continue
+					}
+
+					actionRequestParameters := make(map[string]interface{})
+					actionRequestParameters["file"] = cloudStoreUploadFiles(files)
+					actionRequestParameters["path"] = ""
+
+					cloudStore, err := dbResource.GetCloudStoreByNameWithTransaction(col.ForeignKeyData.Namespace, updateTransaction)
+					CheckErr(err, "Failed to get cloud storage details")
+					if err != nil {
+						return nil, err
+					}
+
+					log.Infof("[208] uploading files to cloud storage [%v]", col.ForeignKeyData.Namespace)
+
+					actionRequestParameters["credential_name"] = cloudStore.CredentialName
+					actionRequestParameters["store_provider"] = cloudStore.StoreProvider
+					actionRequestParameters["store_type"] = cloudStore.StoreType
+					actionRequestParameters["name"] = cloudStore.Name
+					actionRequestParameters["root_path"], err = cloudStore.ResolvePath(col.ForeignKeyData.KeyName)
+					if err != nil {
+						return nil, err
+					}
+
+					if len(actionRequestParameters["file"].([]interface{})) > 0 {
+						_, _, errs := uploadActionPerformer.DoAction(actionresponse.Outcome{}, actionRequestParameters, updateTransaction)
+						if len(errs) > 0 {
+							log.Errorf("Failed to upload attachments: %v", errs)
+							return nil, errs[0]
+						}
+					}
+
+					files, ok = val.([]interface{})
+					if ok {
+
+						existingResource, _, loadErr := dbResource.GetSingleRowByReferenceIdWithTransaction(
+							dbResource.model.GetName(), daptinid.DaptinReferenceId(updateObjectReferenceId),
+							map[string]bool{YjsStateMediaType: true}, updateTransaction)
+						if loadErr != nil {
+							return nil, loadErr
+						}
+						existingFiles, decodeErr := assetColumnFiles(existingResource[col.ColumnName])
+						if decodeErr != nil {
+							return nil, decodeErr
+						}
+
+						finalFileSet := mergeCloudStoreFileSet(existingFiles, files)
+
+						val, err = json.Marshal(finalFileSet)
+						CheckErr(err, "Failed to marshal file data to column")
+					}
+
+				default:
+					CheckErr(errors.New("undefined foreign key"), "Data source: %v", col.ForeignKeyData.DataSource)
+				}
+
+			}
+			var err error
+
+			if col.ColumnType == "password" {
+				val, err = BcryptHashString(val.(string))
+				if err != nil {
+					log.Errorf("Failed to convert string to bcrypt hash, not storing the value: %v", err)
+					continue
+				}
+				if dbResource.model.GetName() == USER_ACCOUNT_TABLE_NAME && col.ColumnName == "password" {
+					passwordChanged = true
+				}
+			} else if col.ColumnType == "datetime" {
+				parsedTime, ok := val.(time.Time)
+				if !ok {
+					valString, ok := val.(string)
+					if ok {
+
+						//val, err = time.Parse("2006-01-02T15:04:05.999Z", valString)
+						val, _, err = fieldtypes.GetDateTime(valString)
+						CheckErr(err, fmt.Sprintf("Failed to parse string as date time in update [%v]", val))
+						if err != nil {
+							ok = false
+						}
+					} else {
+						floatVal, ok := val.(float64)
+						if ok {
+							val = time.Unix(int64(floatVal), 0)
+							err = nil
+						}
+					}
+				} else {
+					val = parsedTime
+				}
+				// 2017-07-13T18:30:00.000Z
+
+			} else if col.ColumnType == "enum" {
+				valString, ok := val.(string)
+				if !ok {
+					valString = fmt.Sprintf("%v", val)
+				}
+
+				isEnumOption := false
+				valString = strings.ToLower(valString)
+				for _, enumVal := range col.Options {
+
+					if valString == enumVal.Value {
+						isEnumOption = true
+						break
+
+					}
+
+				}
+
+				if !isEnumOption {
+					log.Printf("Provided value is not a valid enum option, reject request [%v] [%v]", valString, col.Options)
+					return nil, errors.New(fmt.Sprintf("invalid value for %s", col.Name))
+				}
+				val = valString
+
+			} else if col.ColumnType == "encrypted" {
+
+				secret, err := dbResource.ConfigStore.GetConfigValueForWithTransaction("encryption.secret", "backend", updateTransaction)
+				if err != nil {
+					log.Errorf("Failed to get secret from config: %v", err)
+					return nil, errors.New("unable to store a secret at this time")
+				} else {
+					if val == nil {
+						val = ""
+					}
+					val, err = Encrypt([]byte(secret), val.(string))
+					if err != nil {
+						log.Errorf("Failed to convert string to encrypted value, not storing the value: %v", err)
+						val = ""
+					}
+
+				}
+			} else if col.ColumnType == "date" {
+
+				// 2017-07-13T18:30:00.000Z
+
+				parsedTime, ok := val.(time.Time)
+				if !ok {
+					valString, ok := val.(string)
+					if ok {
+
+						val1, err := time.Parse("2006-01-02T15:04:05.999Z", valString)
+
+						InfoErr(err, fmt.Sprintf("Failed to parse string as date [%v]", val))
+						if err != nil {
+							val, err = time.Parse("2006-01-02", val.(string))
+							InfoErr(err, fmt.Sprintf("Failed to parse string as date [%v]", val))
+						} else {
+							val = val1
+						}
+					} else {
+						floatVal, ok := val.(float64)
+						if ok {
+							val = time.Unix(int64(floatVal), 0)
+							err = nil
+						}
+					}
+				} else {
+					val = parsedTime
+				}
+
+			} else if col.ColumnType == "time" {
+				parsedTime, ok := val.(time.Time)
+				if !ok {
+					valString, ok := val.(string)
+					if ok {
+						val, err = time.Parse("15:04:05", valString)
+						CheckErr(err, fmt.Sprintf("Failed to parse string as time [%v]", val))
+					} else {
+						floatVal, ok := val.(float64)
+						if ok {
+							val = time.Unix(int64(floatVal), 0)
+							err = nil
+						}
+					}
+				} else {
+					val = parsedTime
+				}
+				// 2017-07-13T18:30:00.000Z
+
+			} else if col.ColumnType == "truefalse" {
+				valBoolean, ok := val.(bool)
+				if ok {
+					val = valBoolean
+				} else {
+					valString, ok := val.(string)
+					if ok {
+						str := strings.ToLower(strings.TrimSpace(valString))
+						if str == "true" || str == "1" {
+							val = true
+						} else {
+							val = false
+						}
+					} else {
+						valInt, ok := val.(int)
+						if ok {
+							if ok && valInt != 0 {
+								val = true
+							} else if ok {
+								val = false
+							}
+						}
+
+					}
+				}
+			}
+
+			if col.ColumnType == "json" {
+				val, err = jsonColumnStorageValue(val)
+				if err != nil {
+					return nil, invalidJSONColumnError(col.ColumnName, err)
+				}
+			}
+
+			if ok {
+				//dataToInsert[col.ColumnName] = val
+				colsList = append(colsList, col.ColumnName)
+				valsList = append(valsList, val)
+			}
+
+		}
+
+		if dbResource.model.GetName() == "task" {
+			_, scheduleChanged := allChanges["schedule"]
+			_, activeChanged := allChanges["active"]
+			if scheduleChanged || activeChanged {
+				colsList = append(colsList, "next_due_at")
+				valsList = append(valsList, nil)
+			}
+		}
+		colsList = append(colsList, "updated_at")
+		valsList = append(valsList, time.Now())
+
+		colsList = append(colsList, "version")
+		valsList = append(valsList, data.GetNextVersion())
+
+		if len(languagePreferences) == 0 {
+
+			builder := statementbuilder.Squirrel.Update(dbResource.model.GetName()).Prepared(true)
+
+			setVals := make(map[string]interface{})
+			for i := range colsList {
+				setVals[colsList[i]] = valsList[i]
+			}
+			if passwordChanged {
+				setVals[auth.AuthVersionColumn] = goqu.L("COALESCE(auth_version, 1) + 1")
+			}
+			builder = builder.Set(goqu.Record(setVals))
+
+			query, vals, err := builder.
+				Where(goqu.Ex{"reference_id": updateObjectReferenceId[:]}).
+				Where(goqu.Ex{"version": data.GetCurrentVersion()}).ToSQL()
+			//log.Printf("Update query: %v", query)
+			if err != nil {
+				log.Errorf("Failed to create update query: %v", err)
+				return nil, err
+			}
+
+			log.Debugf("Update query [424]: %v", query)
+			res, err := updateTransaction.Exec(query, vals...)
+			if err != nil {
+				log.Errorf("[464] Failed to execute update query [%s] [%v] 411: %v", query, vals, err)
+				return nil, err
+			}
+			rowsAffected, err := res.RowsAffected()
+			if err != nil {
+				log.Warnf("[464] Failed to inspect update rows affected [%s] [%v]: %v", query, vals, err)
+			} else if rowsAffected == 0 {
+				return nil, versionConflictError(fmt.Sprintf("failed to update %s [%s]: no rows matched current version", dbResource.model.GetName(), updateObjectReferenceId.String()))
+			}
+
+		} else if len(languagePreferences) > 0 {
+
+			for _, lang := range languagePreferences {
+
+				langTableCols := make([]interface{}, 0)
+				langTableVals := make([]interface{}, 0)
+
+				for _, col := range colsList {
+					langTableCols = append(langTableCols, col)
+				}
+
+				for _, val := range valsList {
+					langTableVals = append(langTableVals, val)
+				}
+
+				builder := statementbuilder.Squirrel.Update(dbResource.model.GetName() + "_i18n").Prepared(true)
+
+				updateMap := make(map[string]interface{})
+				for i := range langTableCols {
+					updateMap[langTableCols[i].(string)] = langTableVals[i]
+				}
+				builder = builder.Set(updateMap)
+
+				query, vals, err := builder.
+					Where(goqu.Ex{"translation_reference_id": idInt}).Where(goqu.Ex{"language_id": lang}).ToSQL()
+				log.Infof("Update query [455]: %v", query)
+				if err != nil {
+					log.Errorf("Failed to create update query: %v", err)
+				}
+
+				//log.Printf("Update query: %v == %v", query, vals)
+				res, err := updateTransaction.Exec(query, vals...)
+				rowsAffected, err := res.RowsAffected()
+				if err != nil || rowsAffected == 0 {
+					log.Errorf("[502] Failed to execute update query: %v", err)
+
+					nuuid, _ := uuid.NewV7()
+
+					langTableCols = append(langTableCols, "language_id", "translation_reference_id", "reference_id")
+					langTableVals = append(langTableVals, lang, idInt, nuuid[:])
+
+					insert := statementbuilder.Squirrel.Insert(dbResource.model.GetName() + "_i18n").Prepared(true)
+					insert = insert.Cols(langTableCols...)
+					insert = insert.Vals(langTableVals)
+					query, vals, err := insert.ToSQL()
+
+					_, err = updateTransaction.Exec(query, vals...)
+
+					return nil, err
+				}
+			}
+		}
+
+	}
+
+	// Invalidate permission caches for the updated object
+	updatedRefId := daptinid.DaptinReferenceId(updateObjectReferenceId)
+	InvalidateObjectPermissionCache(dbResource.model.GetName(), updatedRefId)
+	InvalidateRowPermissionCache(dbResource.model.GetName(), updatedRefId)
+
+	// Invalidate auth + admin caches when user-group membership is updated
+	if dbResource.model.GetName() == "user_account_user_account_id_has_usergroup_usergroup_id" {
+		if userAccountId, ok := data.GetAllAsAttributes()[USER_ACCOUNT_ID_COLUMN]; ok && userAccountId != nil {
+			if uid, ok := userAccountId.(int64); ok {
+				email := dbResource.GetUserEmailByIdWithTransaction(uid, updateTransaction)
+				if email != "" {
+					auth.InvalidateAuthCacheForEmail(email)
+				}
+				userRefId, err := GetIdToReferenceIdWithTransaction(USER_ACCOUNT_TABLE_NAME, uid, updateTransaction)
+				if err == nil {
+					InvalidateAdminCacheForUser(userRefId)
+				}
+			}
+		}
+	}
+
+	if passwordChanged {
+		seenEmails := make(map[string]bool)
+		for _, emailValue := range []interface{}{
+			data.GetColumnOriginalValue("email"),
+			data.GetAllAsAttributes()["email"],
+		} {
+			email, ok := emailValue.(string)
+			if !ok || email == "" || seenEmails[email] {
+				continue
+			}
+			seenEmails[email] = true
+			auth.InvalidateAuthCacheForEmail(email)
+		}
+		jwtmiddleware.InvalidateTokenCache()
+	}
+
+	// Invalidate parent permission caches when any usergroup relation row is updated
+	if strings.HasSuffix(dbResource.model.GetName(), "_has_usergroup_usergroup_id") {
+		doubledEntity := strings.TrimSuffix(dbResource.model.GetName(), "_id_has_usergroup_usergroup_id")
+		parentType := doubledEntity[:len(doubledEntity)/2]
+		parentIdCol := parentType + "_id"
+		if parentId, ok := data.GetAllAsAttributes()[parentIdCol]; ok && parentId != nil {
+			if pid, ok := parentId.(int64); ok {
+				InvalidateObjectUsergroupRelationPermissionCaches(parentType, pid, updateTransaction)
+			}
+		}
+	}
+
+	if data.IsDirty() && dbResource.tableInfo.IsAuditEnabled {
+
+		auditModel := data.GetAuditModel()
+		log.Tracef("Object [%v][%v] has been changed, trying to audit in %v", data.GetTableName(), data.GetID(), auditModel.GetTableName())
+		if auditModel.GetTableName() != "" {
+			creator, ok := dbResource.Cruds[auditModel.GetTableName()]
+			if !ok {
+				log.Errorf("No creator for audit type: %v", auditModel.GetTableName())
+			} else {
+
+				auditAttrs := auditModel.GetAttributes()
+				for _, col := range dbResource.tableInfo.Columns {
+					if col.IsForeignKey {
+						value := auditAttrs[col.ColumnName]
+						asDir, isDir := value.(daptinid.DaptinReferenceId)
+						if isDir {
+							value = asDir.String()
+							auditModel.Set(col.ColumnName, value)
+						}
+					}
+
+				}
+				auditModel.Set("source_reference_id", updateObjectReferenceId.String())
+				auditModel.Set("operation", AuditOperationUpdate)
+				pr := &http.Request{
+					URL:    req.PlainRequest.URL,
+					Method: "POST",
+				}
+				pr = pr.WithContext(req.PlainRequest.Context())
+				auditCreateRequest := api2go.Request{
+					PlainRequest: pr,
+				}
+				_, err := creator.CreateWithoutFilter(auditModel, auditCreateRequest, updateTransaction)
+				if err != nil {
+					log.Errorf("[542] Failed to create audit entry: %v\n%v", err, auditModel)
+					return nil, err
+				} else {
+					log.Printf("[%v][%v] Created audit record", auditModel.GetTableName(), data.GetID())
+					//log.Printf("ReferenceId for change: %v", resp.Result())
+				}
+			}
+		}
+
+	} else {
+		log.Tracef("[%v][%v] Not creating an audit row", data.GetTableName(), data.GetID())
+	}
+
+	//updatedResource, err := dbResource.GetReferenceIdToObjectWithTransaction(dbResource.model.GetName(), updateObjectReferenceId, updateTransaction)
+	//if err != nil {
+	//	log.Errorf("[511] Failed to select the newly created entry: %v", err)
+	//	return nil, err
+	//}
+
+	for _, rel := range dbResource.model.GetRelations() {
+		relationName := rel.GetRelation()
+
+		log.Tracef("[531] Check relation in Update: %v", rel.String())
+		if rel.GetSubject() == dbResource.model.GetName() {
+
+			if relationName == "belongs_to" || relationName == "has_one" {
+				continue
+			}
+
+			val11, ok := attrs[rel.GetObjectName()]
+			if !ok {
+				continue
+			}
+			returnList := make([]string, 0)
+			var valueList []interface{}
+			valueListMap, ok := val11.([]map[string]interface{})
+			if ok {
+				valueList = MapArrayToInterfaceArray(valueListMap)
+			} else {
+				valueList, ok = val11.([]interface{})
+				if !ok {
+					log.Warnf("invalue value for column [%v]", rel.GetObjectName())
+					continue
+				}
+			}
+
+			if len(valueList) < 1 {
+				attrs[rel.GetObjectName()] = returnList
+				continue
+			}
+
+			log.Tracef("Update object for relation on [%v] : [%v]", rel.GetObjectName(), val11)
+
+			switch relationName {
+			case "has_one":
+			case "belongs_to":
+				break
+
+			case "has_many_and_belongs_to_many":
+				fallthrough
+			case "has_many":
+
+				for _, itemInterface := range valueList {
+					item := itemInterface.(map[string]interface{})
+					//obj := make(map[string]interface{})
+					returnList = append(returnList, item["id"].(string))
+					item[rel.GetObjectName()] = item["id"]
+					item[rel.GetSubjectName()] = updateObjectReferenceId
+					delete(item, "id")
+					delete(item, "meta")
+					delete(item, "type")
+					delete(item, "reference_id")
+
+					attributes, ok := item["attributes"]
+					hasColumns := false
+					if ok {
+						attributesMap, mapOk := attributes.(map[string]interface{})
+						if mapOk {
+							for key, val := range attributesMap {
+
+								isJoinTableColumn := false
+								for _, col := range rel.Columns {
+									if col.Name == key {
+										isJoinTableColumn = true
+										break
+									}
+								}
+								if !isJoinTableColumn {
+									//log.Infof("Attribute [%v] is not a join table column in [%v]", key, rel.GetJoinTableName())
+									continue
+								}
+								log.Infof("Attribute [%v] is a join table column in [%v] value change from [%v] => [%v]", key, rel.GetJoinTableName(), item[key], val)
+
+								if val == nil || key == "reference_id" {
+									continue
+								}
+								item[key] = val
+								hasColumns = true
+							}
+						}
+						delete(item, "attributes")
+					}
+
+					subjectId := data.GetColumnOriginalValue("id")
+					objectId, err := GetReferenceIdToIdWithTransaction(rel.GetObject(), daptinid.InterfaceToDIR(item[rel.GetObjectName()]), updateTransaction)
+					if err != nil {
+						return nil, fmt.Errorf("object not found [%v][%v]", rel.GetObject(), item[rel.GetObjectName()])
+					}
+
+					joinRow, err := GetObjectByWhereClauseWithTransaction(rel.GetJoinTableName(), updateTransaction, goqu.Ex{
+						rel.GetObjectName():  objectId,
+						rel.GetSubjectName(): subjectId,
+					})
+
+					CheckErr(err, "join row not found")
+
+					var modl api2go.Api2GoModel
+					if err != nil || len(joinRow) < 1 {
+						modl = api2go.NewApi2GoModel(rel.GetJoinTableName(), nil, int64(auth.DEFAULT_PERMISSION), nil)
+					} else {
+						item[rel.GetObjectName()] = objectId
+						item[rel.GetSubjectName()] = subjectId
+						modl = api2go.NewApi2GoModelWithData(rel.GetJoinTableName(), nil, int64(auth.DEFAULT_PERMISSION), nil, joinRow[0])
+					}
+
+					modl.SetAttributes(item)
+
+					pr := &http.Request{
+						Method: "POST",
+						URL:    req.PlainRequest.URL,
+					}
+					pr = pr.WithContext(req.PlainRequest.Context())
+
+					if len(joinRow) > 0 {
+
+						if hasColumns && modl.IsDirty() {
+							log.Infof("[629] Updating existing join table row properties: %v", joinRow[0]["reference_id"])
+							modl.SetID(string(joinRow[0]["reference_id"].([]byte)))
+							pr.Method = "PATCH"
+
+							_, err = dbResource.Cruds[rel.GetJoinTableName()].UpdateWithTransaction(modl, api2go.Request{
+								PlainRequest: pr,
+							}, updateTransaction)
+							if err != nil {
+								log.Errorf("Failed to insert join table data [%v] : %v", rel.GetJoinTableName(), err)
+								return nil, err
+							}
+						} else {
+							log.Infof("Relation already present [%s]: %v, no columns to update", rel.GetJoinTableName(), joinRow[0]["reference_id"])
+						}
+
+					} else {
+
+						log.Infof("[662] Creating new join table row properties: %v -> %v", rel.GetJoinTableName(), modl.GetAttributes())
+						_, err := dbResource.Cruds[rel.GetJoinTableName()].CreateWithTransaction(modl, api2go.Request{
+							PlainRequest: pr,
+						}, updateTransaction)
+						CheckErr(err, "[624] Failed to update and insert join table row")
+						if err != nil {
+							return nil, err
+						}
+
+					}
+
+				}
+				attrs[rel.GetObjectName()] = returnList
+
+				break
+
+			default:
+				log.Errorf("Unknown relation: %v", relationName)
+			}
+
+		} else {
+
+			val, ok := attrs[rel.GetSubjectName()]
+			if !ok {
+				continue
+			}
+			log.Tracef("Update %v [%v] on: %v -> %v", rel.String(), updateObjectReferenceId, rel.GetSubjectName(), val)
+
+			returnList := make([]daptinid.DaptinReferenceId, 0)
+			//var relUpdateQuery string
+			//var vars []interface{}
+			switch relationName {
+			case "has_one":
+				//intId := updatedResource["id"].(int64)
+				//log.Printf("Converted ids for [%v]: %v", rel.GetObject(), intId)
+
+				valMapList, ok := val.([]interface{})
+
+				if !ok {
+					valMap, ok := val.([]map[string]interface{})
+					if ok {
+						valMapList = MapArrayToInterfaceArray(valMap)
+					} else {
+						log.Warnf("[669] invalid value type for column [%v] = %v", rel.GetSubjectName(), val)
+					}
+				}
+
+				for _, valMapInterface := range valMapList {
+					valMap := valMapInterface.(map[string]interface{})
+
+					foreignObjectReferenceId := daptinid.InterfaceToDIR(valMap[rel.GetSubjectName()])
+					returnList = append(returnList, foreignObjectReferenceId)
+
+					oldRow := map[string]interface{}{
+						rel.GetObjectName(): "",
+						"reference_id":      foreignObjectReferenceId,
+					}
+
+					model := api2go.NewApi2GoModelWithData(rel.GetSubject(), nil, int64(auth.DEFAULT_PERMISSION), nil, oldRow)
+
+					model.SetAttributes(map[string]interface{}{
+						rel.GetObjectName(): updateObjectReferenceId,
+					})
+
+					_, err := dbResource.Cruds[rel.GetSubject()].UpdateWithTransaction(model, req, updateTransaction)
+					if err != nil {
+						log.Errorf("Failed to update [%v][%v]: %v", rel.GetObject(), updateObjectReferenceId, err)
+						return nil, err
+					}
+				}
+
+				//relUpdateQuery, vars, err = statementbuilder.Squirrel.Update(rel.GetSubject()).
+				//    Set(rel.GetObjectName(), intId).Where(goqu.Ex{"reference_id": val}).ToSQL()
+
+				//if err != nil {
+				//  log.Errorf("Failed to make update query: %v", err)
+				//  continue
+				//}
+
+				//log.Printf("Relation update query params: %v", vars)
+
+				break
+			case "belongs_to":
+				//intId := updatedResource["id"].(int64)
+				//log.Printf("Converted ids for [%v]: %v", rel.GetObject(), intId)
+
+				valMapList, ok := val.([]interface{})
+
+				if !ok {
+					valMap, ok := val.([]map[string]interface{})
+					if ok {
+						valMapList = MapArrayToInterfaceArray(valMap)
+					} else {
+						log.Warnf("[719] invalid value type for column [%v] = %v", rel.GetSubjectName(), val)
+					}
+				}
+
+				for _, valMapInterface := range valMapList {
+					valMap := valMapInterface.(map[string]interface{})
+					updateForeignRow := make(map[string]interface{})
+					foreignObjectReferenceId := daptinid.InterfaceToDIR(valMap[rel.GetSubjectName()])
+					if foreignObjectReferenceId == daptinid.NullReferenceId {
+						foreignObjectReferenceId = daptinid.InterfaceToDIR(valMap["reference_id"])
+						if foreignObjectReferenceId == daptinid.NullReferenceId {
+							log.Warnf("reference id not found for subject [%v][%v] for updating [%v][%v]",
+								rel.GetSubjectName(), valMap[rel.GetSubjectName()], dbResource.tableInfo.TableName, updateObjectReferenceId)
+							continue
+						}
+					}
+					returnList = append(returnList, foreignObjectReferenceId)
+
+					updateForeignRow, err = dbResource.GetReferenceIdToObjectWithTransaction(rel.GetSubject(), foreignObjectReferenceId, updateTransaction)
+					if err != nil {
+						log.Errorf("Failed to fetch related row to update [%v] == %v", rel.GetSubject(), valMap)
+						continue
+					}
+					updateForeignRow[rel.GetSubjectName()] = updateObjectReferenceId
+
+					model := api2go.NewApi2GoModelWithData(rel.GetSubject(), nil, int64(auth.DEFAULT_PERMISSION), nil, updateForeignRow)
+
+					_, err := dbResource.Cruds[rel.GetSubject()].UpdateWithTransaction(model, req, updateTransaction)
+					if err != nil {
+						log.Errorf("Failed to update [%v][%v]: %v", rel.GetObject(), updateObjectReferenceId, err)
+						return nil, err
+					}
+				}
+
+				break
+
+			case "has_many_and_belongs_to_many":
+				fallthrough
+			case "has_many":
+				values, ok := val.([]interface{})
+				if !ok {
+					valMap, ok := val.([]map[string]interface{})
+					if ok {
+						values = MapArrayToInterfaceArray(valMap)
+					} else {
+						log.Warnf("[756] invalid value type for column [%v] = %v", rel.GetSubjectName(), val)
+					}
+				}
+
+				for _, itemInterface := range values {
+					item := itemInterface.(map[string]interface{})
+					//obj := make(map[string]interface{})
+					item[rel.GetSubjectName()] = daptinid.InterfaceToDIR(item["id"])
+					returnList = append(returnList, daptinid.InterfaceToDIR(item["id"]))
+					item[rel.GetObjectName()] = updateObjectReferenceId
+					delete(item, "id")
+					delete(item, "meta")
+					delete(item, "type")
+					delete(item, "reference_id")
+
+					attributes, ok := item["attributes"]
+					hasColumns := false
+					if ok {
+						attributesMap, mapOk := attributes.(map[string]interface{})
+						if mapOk {
+							for key, val := range attributesMap {
+								if val == nil || key == "reference_id" {
+									continue
+								}
+								item[key] = val
+								hasColumns = true
+							}
+						}
+						delete(item, "attributes")
+					}
+
+					subjectId, err := GetReferenceIdToIdWithTransaction(rel.GetSubject(),
+						daptinid.InterfaceToDIR(item[rel.GetSubjectName()]), updateTransaction)
+					if err != nil {
+						return nil, fmt.Errorf("subject not found [%v][%v]", rel.GetSubject(), item[rel.GetSubjectName()])
+					}
+					objectId := idInt
+					joinRow, err := GetObjectByWhereClauseWithTransaction(rel.GetJoinTableName(), updateTransaction, goqu.Ex{
+						rel.GetObjectName():  objectId,
+						rel.GetSubjectName(): subjectId,
+					})
+
+					var modl api2go.Api2GoModel
+					if err != nil || len(joinRow) < 1 {
+						modl = api2go.NewApi2GoModel(rel.GetJoinTableName(), nil, int64(auth.DEFAULT_PERMISSION), nil)
+					} else {
+						item[rel.GetObjectName()] = objectId
+						item[rel.GetSubjectName()] = subjectId
+						modl = api2go.NewApi2GoModelWithData(rel.GetJoinTableName(), nil, int64(auth.DEFAULT_PERMISSION), nil, joinRow[0])
+					}
+
+					modl.SetAttributes(item)
+
+					pr := &http.Request{
+						Method: "POST",
+						URL:    req.PlainRequest.URL,
+					}
+
+					pr = pr.WithContext(req.PlainRequest.Context())
+
+					if len(joinRow) > 0 {
+
+						if hasColumns && modl.IsDirty() {
+							log.Infof("[804] Updating existing join table row properties: %v", joinRow[0]["reference_id"])
+							pr.Method = "PATCH"
+
+							_, err = dbResource.Cruds[rel.GetJoinTableName()].UpdateWithTransaction(modl, api2go.Request{
+								PlainRequest: pr,
+							}, updateTransaction)
+							if err != nil {
+								log.Errorf("Failed to insert join table data [%v] : %v", rel.GetJoinTableName(), err)
+								return nil, err
+							}
+						} else {
+							log.Infof("Relation already present [%s]: %v, no columns to update", rel.GetJoinTableName(), joinRow[0]["reference_id"])
+						}
+
+					} else {
+
+						log.Infof("[879] Creating new join table row: %v - %v", rel.GetJoinTableName(),
+							modl.GetAttributes())
+						_, err := dbResource.Cruds[rel.GetJoinTableName()].CreateWithTransaction(modl, api2go.Request{
+							PlainRequest: pr,
+						}, updateTransaction)
+						CheckErr(err, "[871] Failed to update and insert join table row")
+						if err != nil {
+							return nil, err
+						}
+
+					}
+
+				}
+				break
+
+			default:
+				log.Errorf("Unknown relation: %v", relationName)
+			}
+
+			attrs[rel.GetSubjectName()] = returnList
+
+			//_, err = dbResource.db.Exec(relUpdateQuery, vars...)
+			//if err != nil {
+			//  log.Errorf("Failed to execute update query for relation: %v", err)
+			//}
+
+		}
+	}
+
+	data.SetAttributes(attrs)
+
+	for relationName, deleteRelations := range data.DeleteIncludes {
+		referencedRelation := api2go.TableRelation{}
+		referencedTypeName := ""
+		//hostRelationTypeName := ""
+		hostRelationName := ""
+		for _, relation := range dbResource.model.GetRelations() {
+
+			if relation.GetSubject() == dbResource.model.GetTableName() && relation.GetObjectName() == relationName {
+				referencedRelation = relation
+				referencedTypeName = relation.GetObject()
+				//hostRelationTypeName = relation.GetSubject()
+				hostRelationName = relation.GetSubjectName()
+				break
+			} else if relation.GetObject() == dbResource.model.GetTableName() && relation.GetSubjectName() == relationName {
+				referencedRelation = relation
+				//hostRelationTypeName = relation.GetObject()
+				hostRelationName = relation.GetObjectName()
+				referencedTypeName = relation.GetSubject()
+				break
+			}
+		}
+		if referencedRelation.GetRelation() == "" {
+			continue
+		}
+
+		log.Printf("Delete [%v] relation: [%v][%v]", referencedRelation.GetRelation(), relationName, deleteRelations)
+
+		for _, deleteReferneceUuidString := range deleteRelations {
+
+			delRefUUId := uuid.MustParse(deleteReferneceUuidString)
+
+			if canRefer(referencedTypeName, daptinid.DaptinReferenceId(delRefUUId)) {
+
+				otherObjectId, err := GetReferenceIdToIdWithTransaction(referencedTypeName, daptinid.DaptinReferenceId(delRefUUId), updateTransaction)
+
+				if err != nil {
+					log.Errorf("referenced object not found: [%v][%v] - %v", referencedTypeName, deleteReferneceUuidString, err)
+					continue
+				}
+
+				if referencedRelation.Relation == "has_many" || referencedRelation.Relation == "has_many_and_belongs_to_many" {
+
+					joinReference, _, err := dbResource.Cruds[referencedRelation.GetJoinTableName()].GetRowsByWhereClauseWithTransaction(referencedRelation.GetJoinTableName(),
+						nil, updateTransaction, goqu.Ex{
+							relationName:     otherObjectId,
+							hostRelationName: idInt,
+						},
+					)
+					if err != nil {
+						log.Errorf("Referenced relation not found: %v", err)
+						return nil, err
+					}
+					if len(joinReference) < 1 {
+						log.Warnf("nothing to delete for the relation row to delete does not exist - %v[%v] - %v[%v]", relationName, otherObjectId, hostRelationName, idInt)
+						continue
+					}
+
+					joinReferenceObject := joinReference[0]
+					err = dbResource.Cruds[referencedRelation.GetJoinTableName()].DeleteWithoutFilters(
+						daptinid.InterfaceToDIR(joinReferenceObject["reference_id"]), req, updateTransaction)
+					if err != nil {
+						log.Errorf("Failed to delete relation [%v][%v]: %v", referencedRelation.GetSubject(), referencedRelation.GetObjectName(), err)
+						return nil, err
+					}
+				} else {
+					// has_one or belongs_to
+					// todo: write code for belongs_to and has_one relation reference deletes
+					// check for relation side and update the appropriate column
+
+					selfTypeName := referencedRelation.GetSubject()
+					selfSubjectName := referencedRelation.GetSubjectName()
+					targetTypeName := referencedRelation.GetObject()
+					//targetSubjectName := referencedRelation.GetObjectName()
+
+					if selfTypeName != dbResource.model.GetName() {
+						selfTypeName = referencedRelation.GetObject()
+						selfSubjectName = referencedRelation.GetObjectName()
+						targetTypeName = referencedRelation.GetSubject()
+						//targetSubjectName = referencedRelation.GetSubjectName()
+					} else {
+
+					}
+
+					foreignObject, err := dbResource.GetIdToObjectWithTransaction(targetTypeName, otherObjectId, updateTransaction)
+					if err != nil {
+						log.Errorf("Failed to get foreign object by reference deleteReferneceUuidString: %v", err)
+						continue
+					}
+					modelToUpdate := api2go.NewApi2GoModelWithData(referencedTypeName, nil, 0, nil, foreignObject)
+
+					updatedAttributes := map[string]interface{}{
+						selfSubjectName: nil,
+					}
+
+					modelToUpdate.SetAttributes(updatedAttributes)
+					_, err = dbResource.Cruds[referencedTypeName].UpdateWithTransaction(modelToUpdate, req, updateTransaction)
+					CheckErr(err, "Failed to update object to remove reference")
+
+				}
+
+			} else {
+				log.Errorf("Not allowed to delete relation [%v][%v]: %v", referencedRelation.GetSubject(), referencedRelation.GetObjectName(), err)
+			}
+
+		}
+	}
+
+	return data.GetAllAsAttributes(), nil
+
+}
+
+func (dbResource *DbResource) prepareRelationshipReplacements(data *api2go.Api2GoModel, changes map[string]api2go.Change,
+	hostID interface{}, transaction *sqlx.Tx) error {
+	for _, relation := range dbResource.model.GetRelations() {
+		localName := relation.GetSubjectName()
+		if relation.GetSubject() == dbResource.model.GetName() {
+			localName = relation.GetObjectName()
+		}
+		change, supplied := changes[localName]
+		if !supplied {
+			continue
+		}
+		requested := relationshipReplacementReferenceIDs(change.NewValue)
+
+		if relation.GetRelation() == "belongs_to" || relation.GetRelation() == "has_one" {
+			// Forward to-one relationships are physical foreign-key columns and were
+			// handled above. On the inverse side, an explicit list replaces the rows
+			// which point at this object.
+			if relation.GetSubject() == dbResource.model.GetName() {
+				continue
+			}
+			rows, err := GetObjectByWhereClauseWithTransaction(relation.GetSubject(), transaction,
+				goqu.Ex{relation.GetObjectName(): hostID})
+			if err != nil {
+				return err
+			}
+			for _, row := range rows {
+				referenceID := daptinid.InterfaceToDIR(row["reference_id"])
+				if referenceID == daptinid.NullReferenceId || requested[referenceID.String()] {
+					continue
+				}
+				if data.DeleteIncludes == nil {
+					data.DeleteIncludes = make(map[string][]string)
+				}
+				data.DeleteIncludes[localName] = append(data.DeleteIncludes[localName], referenceID.String())
+			}
+			continue
+		}
+		if relation.GetRelation() != "has_many" && relation.GetRelation() != "has_many_and_belongs_to_many" {
+			continue
+		}
+
+		hostColumn := relation.GetObjectName()
+		relatedColumn := relation.GetSubjectName()
+		relatedType := relation.GetSubject()
+		if relation.GetSubject() == dbResource.model.GetName() {
+			hostColumn = relation.GetSubjectName()
+			relatedColumn = relation.GetObjectName()
+			relatedType = relation.GetObject()
+		}
+		rows, err := GetObjectByWhereClauseWithTransaction(relation.GetJoinTableName(), transaction, goqu.Ex{hostColumn: hostID})
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			relatedID, ok := row[relatedColumn].(int64)
+			if !ok {
+				continue
+			}
+			referenceID, err := GetIdToReferenceIdWithTransaction(relatedType, relatedID, transaction)
+			if err != nil {
+				return err
+			}
+			if requested[referenceID.String()] {
+				continue
+			}
+			if data.DeleteIncludes == nil {
+				data.DeleteIncludes = make(map[string][]string)
+			}
+			data.DeleteIncludes[localName] = append(data.DeleteIncludes[localName], referenceID.String())
+		}
+	}
+	return nil
+}
+
+func relationshipReplacementReferenceIDs(value interface{}) map[string]bool {
+	requested := make(map[string]bool)
+	add := func(item map[string]interface{}) {
+		referenceID := daptinid.InterfaceToDIR(item["id"])
+		if referenceID == daptinid.NullReferenceId {
+			referenceID = daptinid.InterfaceToDIR(item["reference_id"])
+		}
+		if referenceID != daptinid.NullReferenceId {
+			requested[referenceID.String()] = true
+		}
+	}
+	switch values := value.(type) {
+	case []interface{}:
+		for _, value := range values {
+			if item, ok := value.(map[string]interface{}); ok {
+				add(item)
+			}
+		}
+	case []map[string]interface{}:
+		for _, item := range values {
+			add(item)
+		}
+	}
+	return requested
+}
+
+func (dbResource *DbResource) Update(obj interface{}, req api2go.Request) (api2go.Responder, error) {
+	data, _ := obj.(api2go.Api2GoModel)
+	// api2go overlays PATCH attributes on the record it just loaded. Its
+	// GetCurrentVersion intentionally refers to that original record; reject a
+	// stale caller revision before middleware or storage work, then let the SQL
+	// version predicate protect the interval between this read and the write.
+	if requested, supplied := data.GetAllAsAttributes()["version"]; supplied {
+		version, valid := requested.(int64)
+		if numeric, ok := requested.(float64); ok && numeric >= 1 && numeric < float64(math.MaxInt64) && numeric == math.Trunc(numeric) {
+			version, valid = int64(numeric), true
+		}
+		if !valid || version < 1 {
+			return nil, api2go.NewHTTPError(nil, "invalid resource version", http.StatusUnprocessableEntity)
+		}
+		if !data.HasVersion() || version != data.GetCurrentVersion() {
+			return nil, api2go.NewHTTPError(nil, "resource version conflict", http.StatusConflict)
+		}
+	}
+	//log.Printf("Update object request: [%v][%v]", dbResource.model.GetTableName(), data.GetID())
+
+	updateRequest := &http.Request{
+		Method: "PATCH",
+		URL:    req.PlainRequest.URL,
+	}
+	updateRequest = updateRequest.WithContext(req.PlainRequest.Context())
+	updateAPIRequest := api2go.Request{PlainRequest: updateRequest, QueryParams: req.QueryParams, Header: req.Header, Pagination: req.Pagination}
+
+	transaction, err := dbResource.Connection().Beginx()
+	defer func() {
+		err = transaction.Rollback()
+		if err != nil {
+			log.Debugf("[1035]Failed to rollback transaction: %v", err)
+		}
+	}()
+	if err != nil {
+		CheckErr(err, "Failed to begin transaction [1029]")
+		return nil, err
+	}
+
+	data.SetType(dbResource.model.GetName())
+	resourceIdUUidString := data.GetID()
+	resourceIdUUid := uuid.MustParse(resourceIdUUidString)
+
+	{
+
+		attributes := data.GetAllAsAttributes()
+		attributes["reference_id"] = resourceIdUUid
+		for _, bf := range dbResource.ms.BeforeUpdate {
+			//log.Printf("Invoke BeforeUpdate [%v][%v] on FindAll Request", bf.String(), dbResource.model.GetName())
+
+			finalData, err := bf.InterceptBefore(dbResource, &updateAPIRequest, []map[string]interface{}{
+				attributes,
+			}, transaction)
+			if err != nil {
+				return nil, err
+			}
+			if len(finalData) == 0 {
+				return nil, fmt.Errorf("failed to updated this object because of [%v]", bf.String())
+			}
+			res := finalData[0]
+			data.SetAttributes(res)
+		}
+	}
+
+	updatedResource, err := dbResource.UpdateWithoutFilters(data, req, transaction)
+	log.Tracef("Completed UpdateWithoutFilters")
+	if err != nil {
+		if errors.Is(err, ErrVersionConflict) {
+			return nil, api2go.NewHTTPError(nil, "resource version conflict", http.StatusConflict)
+		}
+		return NewResponse(nil, nil, 500, nil), err
+	}
+
+	for _, bf := range dbResource.ms.AfterUpdate {
+		log.Tracef("Invoke AfterUpdate [%v][%v] on Update Request [%v]", bf.String(), dbResource.model.GetName(), updatedResource)
+
+		results, err := bf.InterceptAfter(dbResource, &updateAPIRequest, []map[string]interface{}{updatedResource}, transaction)
+		if len(results) != 0 {
+			updatedResource = results[0]
+
+		} else {
+			updatedResource = nil
+		}
+
+		if err != nil {
+			log.Errorf("Error from AfterUpdate middleware: %v", err)
+			return NewResponse(nil, nil, 500, nil), err
+		}
+	}
+	commitErr := transaction.Commit()
+	CheckErr(commitErr, "failed to commit")
+	if commitErr != nil {
+		return nil, commitErr
+	}
+	delete(updatedResource, "id")
+
+	log.Tracef("Completed update request [%v]", dbResource.model.GetName())
+	publicModel, err := newPublicApi2GoModel(dbResource.model.GetName(), dbResource.model.GetColumns(), dbResource.model.GetDefaultPermission(), dbResource.model.GetRelations(), updatedResource)
+	if err != nil {
+		return nil, err
+	}
+	return NewResponse(nil, publicModel, 200, nil), nil
+
+}
+
+func mergeCloudStoreFileSet(existingFiles []map[string]interface{}, incomingFiles []interface{}) []map[string]interface{} {
+	finalFileSet := make([]map[string]interface{}, 0, len(existingFiles)+len(incomingFiles))
+	existingFilesMap := make(map[string]int)
+
+	for _, file := range existingFiles {
+		fileName := file["name"].(string)
+		if _, ok := existingFilesMap[fileName]; ok {
+			continue
+		}
+		existingFilesMap[fileName] = len(finalFileSet)
+		finalFileSet = append(finalFileSet, copyFileMetadata(file))
+	}
+
+	for i := range incomingFiles {
+		file := incomingFiles[i].(map[string]interface{})
+		delete(file, "file")
+		if !isInlineFileAsset(file) {
+			delete(file, "contents")
+		}
+		incomingFiles[i] = file
+
+		fileName := file["name"].(string)
+		if existingIndex, ok := existingFilesMap[fileName]; ok {
+			for key, value := range file {
+				finalFileSet[existingIndex][key] = value
+			}
+			continue
+		}
+
+		existingFilesMap[fileName] = len(finalFileSet)
+		finalFileSet = append(finalFileSet, copyFileMetadata(file))
+	}
+
+	return finalFileSet
+}
+
+func copyFileMetadata(file map[string]interface{}) map[string]interface{} {
+	copiedFile := make(map[string]interface{}, len(file))
+	for key, value := range file {
+		if key == "file" || (key == "contents" && !isInlineFileAsset(file)) {
+			continue
+		}
+		copiedFile[key] = value
+	}
+	return copiedFile
+}
+
+func (dbResource *DbResource) UpdateWithTransaction(obj interface{}, req api2go.Request, transaction *sqlx.Tx) (api2go.Responder, error) {
+	return dbResource.updateWithTransaction(obj, req, transaction, dbResource.ms.BeforeUpdate, dbResource.ms.AfterUpdate,
+		dbResource.UpdateWithoutFilters)
+}
+
+func (dbResource *DbResource) updateAfterAuthorizationWithTransaction(obj interface{}, req api2go.Request, transaction *sqlx.Tx) (api2go.Responder, error) {
+	return dbResource.updateWithTransaction(obj, req, transaction,
+		lifecycleInterceptors(dbResource.ms.BeforeUpdate), lifecycleInterceptors(dbResource.ms.AfterUpdate),
+		dbResource.updateWithoutFiltersAfterAuthorization)
+}
+
+func (dbResource *DbResource) updateWithTransaction(obj interface{}, req api2go.Request, transaction *sqlx.Tx,
+	before, after []DatabaseRequestInterceptor,
+	persist func(interface{}, api2go.Request, *sqlx.Tx) (map[string]interface{}, error)) (api2go.Responder, error) {
+	data, _ := obj.(api2go.Api2GoModel)
+	//log.Printf("Update object request: [%v][%v]", dbResource.model.GetTableName(), data.GetID())
+
+	updateRequest := &http.Request{
+		Method: "PATCH",
+		URL:    req.PlainRequest.URL,
+	}
+	updateRequest = updateRequest.WithContext(req.PlainRequest.Context())
+	updateAPIRequest := api2go.Request{PlainRequest: updateRequest, QueryParams: req.QueryParams, Header: req.Header, Pagination: req.Pagination}
+
+	data.SetType(dbResource.model.GetName())
+
+	for _, bf := range before {
+		//log.Printf("Invoke BeforeUpdate [%v][%v] on FindAll Request", bf.String(), dbResource.model.GetName())
+
+		finalData, err := bf.InterceptBefore(dbResource, &updateAPIRequest, []map[string]interface{}{
+			data.GetAllAsAttributes(),
+		}, transaction)
+		if err != nil {
+			log.Errorf("Error From BeforeUpdate middleware: %v", err)
+			return nil, err
+		}
+		if len(finalData) == 0 {
+			return nil, fmt.Errorf("failed to updated this object because of [%v]", bf.String())
+		}
+		res := finalData[0]
+		data.SetAttributes(res)
+	}
+
+	updatedResource, err := persist(data, req, transaction)
+	log.Tracef("Completed UpdateWithoutFilters in UpdateWithTransaction")
+
+	if err != nil {
+		return NewResponse(nil, nil, 500, nil), err
+	}
+
+	for _, bf := range after {
+		log.Tracef("Invoke AfterUpdate [%v][%v] on FindAll Request", bf.String(), dbResource.model.GetName())
+
+		results, err := bf.InterceptAfter(dbResource, &updateAPIRequest, []map[string]interface{}{updatedResource}, transaction)
+		if len(results) != 0 {
+			updatedResource = results[0]
+
+		} else {
+			updatedResource = nil
+		}
+
+		if err != nil {
+			log.Errorf("Error from AfterUpdate middleware: %v", err)
+			return nil, err
+		}
+	}
+	delete(updatedResource, "id")
+
+	publicModel, err := newPublicApi2GoModel(dbResource.model.GetName(), dbResource.model.GetColumns(), dbResource.model.GetDefaultPermission(), dbResource.model.GetRelations(), updatedResource)
+	if err != nil {
+		return nil, err
+	}
+	return NewResponse(nil, publicModel, 200, nil), nil
+
+}

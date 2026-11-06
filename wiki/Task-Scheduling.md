@@ -1,0 +1,514 @@
+# Task Scheduling
+
+**Tested ✓ 2026-01-26**
+
+Cron-based job scheduling for automated background tasks using the `task` table.
+
+## Overview
+
+Daptin's task scheduling system:
+- Executes actions on a schedule (cron expressions or intervals)
+- Runs tasks as a specific user with their permissions
+- Uses [robfig/cron/v3](https://github.com/robfig/cron) for scheduling
+- Supports any action defined in the system
+- Runs within database transactions for safety
+
+In a cluster, every node loads scheduled tasks, but the database grants each
+due occurrence to only one node. User-created tasks and recurring system jobs
+use the same task scheduler and action path. A failed action consumes that
+occurrence; there is no automatic retry. If the winning node stops after the
+claim and before the action finishes, that occurrence may be missed. External
+effects still require their own idempotency guarantees when needed. See
+[[Clustering]].
+
+## Critical Requirements
+
+⚠️ **Tasks will NOT execute unless these requirements are met:**
+
+1. **`as_user_id` MUST be set** - Tasks without a user context won't execute
+2. **`active` must be `true`** - Inactive tasks are not registered with the scheduler
+3. **Server restart required for new or edited tasks** - Cron registrations and action details load on startup. Deactivating a loaded task stops its next run immediately; reactivating it resumes on a later tick if its schedule has not changed.
+4. **Valid `action_name`** - Must reference an existing action in the system
+5. **Valid `schedule`** - Must be parseable by robfig/cron library
+
+**Quick Check:**
+```bash
+curl -s "http://localhost:6336/api/task?include=as_user_id" \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq '.data[] | {name: .attributes.name, active: .attributes.active, execution_user: .relationships.as_user_id.data.id}'
+```
+
+## The `task` Table
+
+Tasks are stored in the `task` table:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` | varchar(100) | Unique task identifier |
+| `action_name` | varchar(100) | Action to execute |
+| `entity_name` | varchar(100) | Target entity/table |
+| `schedule` | varchar(100) | Cron expression or interval |
+| `active` | bool | Enable/disable the task |
+| `attributes` | text (JSON) | Parameters passed to the action |
+| `job_type` | varchar(100) | Task category (e.g., backup, sync) |
+
+The task also has a relationship to `user_account` via `as_user_id` to specify execution context.
+
+## Schedule Syntax
+
+### Predefined Schedules
+
+| Schedule | Description |
+|----------|-------------|
+| `@yearly` or `@annually` | January 1, 00:00 |
+| `@monthly` | First day of month, 00:00 |
+| `@weekly` | Sunday, 00:00 |
+| `@daily` or `@midnight` | Every day, 00:00 |
+| `@hourly` | Every hour on the hour |
+
+### Interval Schedules
+
+| Schedule | Description |
+|----------|-------------|
+| `@every 15s` | Every 15 seconds |
+| `@every 5m` | Every 5 minutes |
+| `@every 1h` | Every hour |
+| `@every 30m` | Every 30 minutes |
+| `@every 24h` | Every 24 hours |
+
+### Cron Expressions
+
+Standard 5-field cron format: `minute hour day month weekday`
+
+| Expression | Description |
+|------------|-------------|
+| `0 0 * * *` | Daily at midnight |
+| `0 3 * * *` | Daily at 3 AM |
+| `0 9 * * 1` | Every Monday at 9 AM |
+| `*/15 * * * *` | Every 15 minutes |
+| `0 */6 * * *` | Every 6 hours |
+| `0 12 1 * *` | First day of month at noon |
+| `0 9-17 * * 1-5` | 9 AM to 5 PM on weekdays |
+
+## Managing Tasks via API
+
+### List All Tasks
+
+```bash
+curl http://localhost:6336/api/task \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Create a Task
+
+```bash
+curl -X POST http://localhost:6336/api/task \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "attributes": {
+        "name": "daily_cleanup",
+        "action_name": "cleanup_old_data",
+        "entity_name": "session",
+        "schedule": "@daily",
+        "active": true,
+        "job_type": "maintenance",
+        "attributes": "{\"days_old\": 30}"
+      },
+      "relationships": {
+        "as_user_id": {
+          "data": {"type":"user_account","id":"EXECUTION_USER_REFERENCE_ID"}
+        }
+      }
+    }
+  }'
+```
+
+Use the execution user's public `reference_id` from an authorized
+`GET /api/user_account` response. The scheduler reloads that account and its
+persisted usergroup relationships for each run. If the relationship is absent,
+the task is rejected during registration. If the account is deleted or can no
+longer authorize the action/resource, execution fails; task ownership does not
+grant extra access.
+
+### Update a Task
+
+```bash
+curl -X PATCH "http://localhost:6336/api/task/$TASK_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "id": "'"$TASK_ID"'",
+      "attributes": {
+        "schedule": "@every 2h",
+        "active": true
+      }
+    }
+  }'
+```
+
+### Disable a Task
+
+```bash
+curl -X PATCH "http://localhost:6336/api/task/$TASK_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "id": "'"$TASK_ID"'",
+      "attributes": {
+        "active": false
+      }
+    }
+  }'
+```
+
+### Delete a Task
+
+```bash
+curl -X DELETE "http://localhost:6336/api/task/$TASK_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Task Execution
+
+### Execution Flow
+
+When a task triggers:
+
+1. Daptin selects the account configured for the task.
+2. It checks that account's current group memberships and action permissions.
+3. It runs the configured action and its outcomes in order.
+4. It logs whether the action succeeded or failed. External effects from
+   outcomes that already ran may still have occurred when a later outcome fails.
+
+### Execution Context
+
+Tasks execute with:
+- User permissions from `as_user_id` relationship
+- Full action capabilities
+- Background execution (no HTTP response)
+- Database transaction wrapping
+
+The relationship is the only execution-identity authority. If it is absent or
+no longer resolves to a user, Daptin does not register or execute the task. It
+does not fall back to a guest, owner, email lookup, or administrator identity.
+
+## Built-in System Tasks
+
+Daptin creates these tasks automatically:
+
+Recurring system tasks are stored as `task` resources and appear in the task API.
+
+| Task | Schedule | Entity | Action | Purpose |
+|------|----------|--------|--------|---------|
+| Mail Server Sync | `@every 1h` | `mail_server` | `sync_mail_servers` | Sync IMAP accounts |
+| Column Storage Sync | `@every 30m` | `world` | `sync_column_storage` | Sync asset columns to cloud |
+| Site Storage Sync | `@every 1h` | `site` | `sync_site_storage` | Sync subsites to cloud storage |
+| Outbox Processing | `@every 5m` | `outbox` | `process_outbox` | Process queued mail |
+| Data Exchange Processing | `@every 1s` | `exchange_run` | `process_data_exchange_executions` | Process data exchange runs |
+
+## Common Task Patterns
+
+### Email Synchronization
+
+```bash
+curl -X POST http://localhost:6336/api/task \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "attributes": {
+        "name": "mail_sync",
+        "action_name": "sync_mail_servers",
+        "entity_name": "mail_server",
+        "schedule": "@every 1h",
+        "active": true,
+        "job_type": "sync",
+        "attributes": "{}"
+      }
+    }
+  }'
+```
+
+### Data Export/Backup
+
+```bash
+curl -X POST http://localhost:6336/api/task \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "attributes": {
+        "name": "daily_backup",
+        "action_name": "export_data",
+        "entity_name": "world",
+        "schedule": "0 2 * * *",
+        "active": true,
+        "job_type": "backup",
+        "attributes": "{\"format\": \"json\", \"table_name\": \"orders\"}"
+      }
+    }
+  }'
+```
+
+### Cloud Storage Sync
+
+```bash
+curl -X POST http://localhost:6336/api/task \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "attributes": {
+        "name": "storage_sync",
+        "action_name": "sync_column_storage",
+        "entity_name": "world",
+        "schedule": "@every 30m",
+        "active": true,
+        "job_type": "sync",
+        "attributes": "{\"table_name\": \"documents\", \"column_name\": \"attachment\"}"
+      }
+    }
+  }'
+```
+
+### Integration Sync
+
+```bash
+curl -X POST http://localhost:6336/api/task \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "attributes": {
+        "name": "crm_sync",
+        "action_name": "execute_integration",
+        "entity_name": "integration",
+        "schedule": "@every 6h",
+        "active": true,
+        "job_type": "integration",
+        "attributes": "{\"integration_name\": \"salesforce\"}"
+      }
+    }
+  }'
+```
+
+## Setting User Context
+
+Tasks need to run as a specific user. Link the task to a user account:
+
+### Via Relationship
+
+```bash
+# First, get the user reference_id
+USER_REF=$(curl -s http://localhost:6336/api/user_account \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq -r '.data[0].attributes.reference_id')
+
+# Create task with user relationship
+curl -X POST http://localhost:6336/api/task \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{
+    "data": {
+      "type": "task",
+      "attributes": {
+        "name": "admin_task",
+        "action_name": "generate_report",
+        "entity_name": "analytics",
+        "schedule": "@weekly",
+        "active": true
+      },
+      "relationships": {
+        "as_user_id": {
+          "data": {
+            "type": "user_account",
+            "id": "'"$USER_REF"'"
+          }
+        }
+      }
+    }
+  }'
+```
+
+## Error Handling
+
+Task execution errors:
+- **Logged** - Errors are logged for debugging
+- **Transaction Rollback** - Failed tasks rollback their changes
+- **Continue Execution** - Other scheduled tasks continue running
+- **Retry on Next Run** - Failed tasks retry on next scheduled execution
+
+No automatic retry mechanism exists between scheduled runs.
+
+Identity resolution and permission checks happen before action outcomes. A
+missing execution user or denied action therefore produces no downstream action
+side effect.
+
+## Task Lifecycle
+
+### Startup
+
+1. Daptin loads saved tasks
+2. Active tasks are registered with the cron scheduler
+3. Scheduler starts running in background
+
+### Runtime
+
+1. Cron triggers task at scheduled time
+2. Task executes within transaction
+3. Success/failure is logged
+
+### Shutdown
+
+1. Daptin stops scheduling new runs
+2. Running tasks complete their current execution
+3. No new tasks are started
+
+## Defining Tasks in Schema
+
+Tasks can be pre-defined in your YAML schema:
+
+```yaml
+Tasks:
+  - Name: hourly_sync
+    Schedule: "@every 1h"
+    ActionName: sync_external_data
+    EntityName: integration
+    AsUserEmail: system@example.com
+    Active: true
+    Attributes:
+      source: external_api
+
+  - Name: daily_report
+    Schedule: "0 8 * * *"
+    ActionName: generate_report
+    EntityName: report
+    AsUserEmail: reports@example.com
+    Active: true
+    Attributes:
+      type: daily
+      format: pdf
+```
+
+`AsUserEmail` is schema-import input only. During schema synchronization Daptin
+resolves it to the task's persisted `as_user_id` relationship. An unknown email
+causes that task synchronization to fail; runtime execution never looks up a
+user by email.
+
+## Best Practices
+
+1. **Use appropriate intervals** - Don't schedule tasks more frequently than needed
+2. **Set user context** - Always specify `as_user_id` for proper permissions
+3. **Test actions first** - Verify the action works manually before scheduling
+4. **Use meaningful names** - Clear, descriptive task names
+5. **Monitor execution** - Check logs for task failures
+6. **Keep attributes minimal** - Only pass necessary parameters
+7. **Consider load** - Schedule heavy tasks during off-peak hours
+
+## Troubleshooting
+
+### Task Not Running
+
+**Symptoms:** Task created but no execution logs, "Register task" log missing on startup
+
+**Solutions:**
+
+1. **Check `active` is `true`**
+   ```bash
+   curl -s "http://localhost:6336/api/task/$TASK_ID" \
+     -H "Authorization: Bearer $TOKEN" | jq '.data.attributes.active'
+   ```
+
+2. **Verify `as_user_id` is set** ⚠️ **CRITICAL**
+   ```bash
+   curl -s "http://localhost:6336/api/task/$TASK_ID?include=as_user_id" \
+     -H "Authorization: Bearer $TOKEN" | jq '.data.relationships.as_user_id.data.id'
+   ```
+
+3. **Restart server to load task**
+   ```bash
+   ./scripts/testing/test-runner.sh stop
+   ./scripts/testing/test-runner.sh start
+
+   # Verify registration
+   tail -f /tmp/daptin.log | grep "Register task"
+   # Expected: INFO[...] Register task [action_name] at schedule
+   ```
+
+4. **Verify `schedule` syntax is valid**
+   - Use `@every 1m` for quick testing
+   - Cron: 5 fields `* * * * *` (not 6!)
+   - Check [Schedule Syntax](#schedule-syntax) section
+
+### Task Fails
+
+**Symptoms:** Task is registered but logs show `scheduled task failed`
+
+**Solutions:**
+
+1. **Check server logs for error details**
+   ```bash
+   tail -f /tmp/daptin.log | grep -i error | grep task
+   ```
+
+2. **Test action manually with same parameters**
+   ```bash
+   curl -X POST http://localhost:6336/action/{entity_name}/{action_name} \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"attributes": YOUR_TASK_ATTRIBUTES}'
+   ```
+
+3. **Verify user has required permissions**
+   - User in `as_user_id` must have permission for the action
+   - Test with admin user first
+   - Check user's usergroup memberships
+
+4. **Check attributes JSON is valid**
+   ```bash
+   # Test JSON parsing
+   echo '{"your": "attributes"}' | jq .
+   ```
+
+### Monitoring Task Execution
+
+```bash
+# Real-time task monitoring
+tail -f /tmp/daptin.log | grep -E "Register task|scheduled task"
+
+# Expected logs:
+# INFO[...] Register task [action_name] at schedule
+
+# Check for errors
+tail -f /tmp/daptin.log | grep -i "scheduled task failed"
+```
+
+### View Task Configuration
+
+```bash
+# Get all tasks
+curl "http://localhost:6336/api/task?include=as_user_id" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Get specific task
+curl "http://localhost:6336/api/task/{task_id}" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Related
+
+- [[Actions-Overview|Actions Overview]] - Actions that tasks can execute
+- [[Custom-Actions|Custom Actions]] - Define custom actions for tasks
+- [[Integrations|Integrations]] - External service integration actions
+- [[Cloud-Storage|Cloud Storage]] - Cloud sync task configuration

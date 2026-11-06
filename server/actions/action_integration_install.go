@@ -1,0 +1,707 @@
+package actions
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/artpar/api2go/v2"
+	"github.com/daptin/daptin/server/actionresponse"
+	"github.com/daptin/daptin/server/id"
+	"github.com/daptin/daptin/server/resource"
+	"github.com/getkin/kin-openapi/openapi2"
+	"github.com/getkin/kin-openapi/openapi2conv"
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/ghodss/yaml"
+	"github.com/go-redis/redis/v8"
+	"github.com/gobuffalo/flect"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	log "github.com/sirupsen/logrus"
+)
+
+const IntegrationRuntimeInstallTopic = "daptin.integration.install"
+
+type IntegrationRuntimeInstallMessage struct {
+	ReferenceID      string `json:"reference_id"`
+	ProviderName     string `json:"provider_name"`
+	RequestID        string `json:"request_id"`
+	SourceInstanceID string `json:"source_instance_id"`
+}
+
+/*
+*
+
+	Become administrator of daptin action implementation
+*/
+type integrationInstallationPerformer struct {
+	cruds       map[string]*resource.DbResource
+	integration resource.Integration
+	router      *openapi3.T
+	commandMap  map[string]*openapi3.Operation
+	pathMap     map[string]string
+	methodMap   map[string]string
+	configStore *resource.ConfigStore
+	instanceID  string
+}
+
+// Name of the action
+func (d *integrationInstallationPerformer) Name() string {
+	return "integration.install"
+}
+
+// Perform action and try to make the current user the admin of the system
+// Checks CanBecomeAdmin and then invokes BecomeAdmin if true
+func (d *integrationInstallationPerformer) DoAction(request actionresponse.Outcome, inFieldMap map[string]interface{}, transaction *sqlx.Tx) (api2go.Responder, []actionresponse.ActionResponse, []error) {
+
+	referenceId := daptinid.InterfaceToDIR(inFieldMap["reference_id"])
+	integrationCrud := d.cruds["integration"]
+	if integrationCrud == nil {
+		log.Errorf("install_integration failed: integration resource is not available")
+		return nil, nil, []error{errors.New("integration resource is not available")}
+	}
+	integration, _, err := integrationCrud.GetSingleRowByReferenceIdWithTransaction("integration", referenceId, nil, transaction)
+	if err != nil {
+		log.Warnf("install_integration failed loading integration reference_id=[%s]: %v", referenceId.String(), err)
+		return nil, nil, []error{err}
+	}
+
+	spec, ok := integration["specification"]
+	if !ok || spec == "" {
+		log.Warnf("install_integration failed: no specification present reference_id=[%s]", referenceId.String())
+		return nil, nil, []error{errors.New("no specification present")}
+	}
+
+	specString, ok := spec.(string)
+	if !ok {
+		log.Warnf("install_integration failed: specification has invalid type [%T] reference_id=[%s]", spec, referenceId.String())
+		return nil, nil, []error{fmt.Errorf("specification must be a string, got %T", spec)}
+	}
+	specBytes := []byte(specString)
+
+	if integration["specification_format"] == "yaml" {
+
+		specBytes, err = yaml.YAMLToJSON(specBytes)
+
+		if err != nil {
+			log.Errorf("Failed to convert yaml to json for integration: %v", err)
+			return nil, nil, []error{err}
+		}
+
+	}
+
+	var router *openapi3.T
+
+	if integration["specification_language"] == "openapiv2" {
+
+		openapiv2Spec := openapi2.T{}
+
+		err := json.Unmarshal(specBytes, &openapiv2Spec)
+
+		if err != nil {
+			log.Errorf("Failed to unmarshal as openapiv2: %v", err)
+			return nil, nil, []error{err}
+		}
+
+		router, err = openapi2conv.ToV3(&openapiv2Spec)
+
+		if err != nil {
+			log.Errorf("Failed to convert to openapi v3 spec: %v", err)
+			return nil, nil, []error{err}
+		}
+
+	}
+
+	if err != nil {
+		return nil, nil, []error{err}
+	}
+
+	if router == nil {
+
+		router, err = openapi3.NewLoader().LoadFromData(specBytes)
+	}
+
+	commandMap := make(map[string]*openapi3.Operation)
+	pathMap := make(map[string]string)
+	methodMap := make(map[string]string)
+	for path, pathItem := range router.Paths {
+		if pathItem == nil {
+			log.Warnf("install_integration skipping nil path item provider=[%v] path=[%s]", integration["name"], path)
+			continue
+		}
+		for method, command := range pathItem.Operations() {
+			if command == nil {
+				log.Warnf("install_integration skipping nil operation provider=[%v] method=[%s] path=[%s]", integration["name"], method, path)
+				continue
+			}
+			operationID := command.OperationID
+			if len(operationID) == 0 {
+				operationID = method + " " + path
+			}
+			if _, exists := commandMap[operationID]; exists {
+				log.Warnf("install_integration rejected duplicate operationId provider=[%v] operation=[%s]", integration["name"], operationID)
+				return nil, nil, []error{fmt.Errorf("duplicate operationId [%s] in integration [%s]", operationID, integration["name"])}
+			}
+			log.Debugf("install_integration discovered operation provider=[%v] operation=[%s] method=[%s] path=[%s]", integration["name"], operationID, method, path)
+			commandMap[operationID] = command
+			pathMap[operationID] = path
+			methodMap[operationID] = method
+		}
+	}
+
+	actions := make([]actionresponse.Action, 0)
+
+	authType := strings.ToLower(fmt.Sprintf("%v", integration["authentication_type"]))
+
+	for commandId, command := range commandMap {
+
+		path := pathMap[commandId]
+		host, err := selectedIntegrationServerBaseURL(router, router.Paths.Find(path), command)
+		if err != nil {
+			return nil, nil, []error{fmt.Errorf("integration operation [%s]: %w", commandId, err)}
+		}
+
+		params, err := GetParametersNames(host + path)
+		if err != nil {
+			log.Errorf("Failed to get parameter names from [%v] == %v", host+path, err)
+			return nil, nil, []error{err}
+		}
+		cols := make([]api2go.ColumnInfo, 0)
+
+		attrs := map[string]interface{}{}
+
+		authUsage, err := resource.IntegrationOperationAuthenticationUsage(router, command, authType)
+		if err != nil {
+			return nil, nil, []error{fmt.Errorf("integration operation [%s] has invalid security requirements: %w", commandId, err)}
+		}
+
+		if authUsage.UsesAuthentication && authType == "oauth2" {
+			cols = append(cols, api2go.ColumnInfo{
+				Name:              "oauth_token_id",
+				ColumnName:        "oauth_token_id",
+				ColumnType:        "hidden",
+				DataType:          "varchar(100)",
+				IsNullable:        !authUsage.RequiresAuthentication,
+				ColumnDescription: "OAuth token reference id to use for this integration execution.",
+			})
+			attrs["oauth_token_id"] = "~oauth_token_id"
+		} else if authUsage.UsesAuthentication && authType == "custom_credentials" {
+			cols = append(cols, api2go.ColumnInfo{
+				Name:              "credential_id",
+				ColumnName:        "credential_id",
+				ColumnType:        "hidden",
+				DataType:          "varchar(100)",
+				IsNullable:        !authUsage.RequiresAuthentication,
+				ColumnDescription: "Credential reference id to use for this integration execution.",
+			})
+			attrs["credential_id"] = "~credential_id"
+		}
+
+		for _, param := range params {
+			cols = append(cols, api2go.ColumnInfo{
+				Name:       param,
+				ColumnName: param,
+				ColumnType: "label",
+				DataType:   "varchar(100)",
+				IsNullable: false,
+			})
+			attrs[param] = "~" + param
+		}
+
+		for _, param := range command.Parameters {
+			if param == nil || param.Value == nil {
+				return nil, nil, []error{fmt.Errorf("integration operation [%s] contains an unresolved parameter", commandId)}
+			}
+			if isIntegrationRuntimeParameter(router, param.Value, nil, nil) {
+				continue
+			}
+			cols = append(cols, api2go.ColumnInfo{
+				Name:       param.Value.Name,
+				ColumnName: param.Value.Name,
+				ColumnType: "label",
+				DataType:   "varchar(100)",
+				IsNullable: !param.Value.Required,
+			})
+			attrs[param.Value.Name] = "~" + param.Value.Name
+
+		}
+
+		if command.RequestBody != nil && command.RequestBody.Value != nil {
+
+			contents := command.RequestBody.Value.Content
+
+			bodyMedia := contents.Get("application/json")
+			multipart := false
+			if bodyMedia == nil && contents.Get("application/x-www-form-urlencoded") == nil {
+				bodyMedia = contents.Get("multipart/form-data")
+				multipart = bodyMedia != nil
+			}
+
+			if bodyMedia != nil {
+				if multipart && (bodyMedia.Schema == nil || bodyMedia.Schema.Value == nil || bodyMedia.Schema.Value.Type != "object") {
+					return nil, nil, []error{fmt.Errorf("integration operation [%s] needs an object schema for multipart form data", commandId)}
+				}
+				var bodyParameterNames []string
+				if multipart {
+					for name := range bodyMedia.Schema.Value.Properties {
+						bodyParameterNames = append(bodyParameterNames, name)
+					}
+					sort.Strings(bodyParameterNames)
+				} else {
+					bodyParameterNames, err = GetBodyParameterNamesFromSchemaRef(ModeRequest, command.RequestBody.Value.Required, bodyMedia.Schema)
+					if err != nil {
+						err = fmt.Errorf("install_integration failed for %v operation %s %s %s: %w", integration["name"], commandId, strings.ToUpper(methodMap[commandId]), path, err)
+						log.Errorf("Failed to get parameter names from body [%v] == %v", host+path, err)
+						return nil, nil, []error{err}
+					}
+				}
+
+				requiredBodyParameters := requiredIntegrationBodyParameters(command.RequestBody.Value.Required, bodyMedia.Schema)
+				for _, param := range bodyParameterNames {
+					columnType := "label"
+					dataType := "varchar(100)"
+					if multipart {
+						if property := bodyMedia.Schema.Value.Properties[param]; property != nil && property.Value != nil &&
+							(property.Value.Type == "object" || property.Value.Type == "array" || property.Value.Format == "binary") {
+							columnType = "json"
+							dataType = "text"
+						}
+					}
+					cols = append(cols, api2go.ColumnInfo{
+						Name:       param,
+						ColumnName: param,
+						ColumnType: columnType,
+						DataType:   dataType,
+						IsNullable: !requiredBodyParameters[param],
+					})
+					attrs[param] = "~" + param
+					if multipart {
+						attrs[param] = "~attributes." + param
+					}
+				}
+			}
+		}
+
+		integrationName, ok := stringField(integration, "name")
+		if !ok {
+			log.Warnf("install_integration failed: name is missing or invalid reference_id=[%s]", referenceId.String())
+			return nil, nil, []error{errors.New("integration name must be a string")}
+		}
+		actionName, err := resource.IntegrationOperationActionName(integrationName, commandId)
+		if err != nil {
+			return nil, nil, []error{err}
+		}
+		action := actionresponse.Action{}
+		action.Name = actionName
+		action.Label = flect.Humanize(integrationName + " " + commandId)
+		action.OnType = "integration"
+		action.InFields = cols
+		action.InstanceOptional = true
+
+		action.OutFields = []actionresponse.Outcome{
+			{
+				Type:       integrationName,
+				Method:     commandId,
+				Attributes: attrs,
+			},
+		}
+
+		actions = append(actions, action)
+
+	}
+
+	err = resource.UpdateActionTable(&resource.CmsConfig{
+		Actions: actions,
+	}, transaction)
+	if err != nil {
+		log.Errorf("install_integration failed updating action table provider=[%v]: %v", integration["name"], err)
+		return nil, []actionresponse.ActionResponse{}, []error{err}
+	}
+
+	err = RefreshIntegrationRuntimeByReferenceID(d.cruds, d.configStore, referenceId)
+	if err != nil {
+		log.Errorf("install_integration failed refreshing runtime mappings provider=[%v]: %v", integration["name"], err)
+	} else {
+		log.Infof("install_integration completed provider=[%v] operations=%d", integration["name"], len(actions))
+		if providerName, ok := stringField(integration, "name"); ok {
+			requestID := uuid.NewString()
+			if publishErr := PublishIntegrationRuntimeInstallEvent(d.cruds, referenceId, providerName, requestID, d.instanceID); publishErr != nil {
+				log.Warnf("install_integration completed locally but failed to broadcast runtime refresh provider=[%s] request_id=[%s]: %v", providerName, requestID, publishErr)
+			}
+		}
+	}
+	return nil, []actionresponse.ActionResponse{}, []error{err}
+}
+
+func (d *integrationInstallationPerformer) refreshInstalledIntegrationPerformer(integration map[string]interface{}, transaction *sqlx.Tx) error {
+	return RefreshIntegrationRuntimeFromRow(d.cruds, d.configStore, integration, transaction)
+}
+
+func RefreshIntegrationRuntimeFromRow(cruds map[string]*resource.DbResource, configStore *resource.ConfigStore, integration map[string]interface{}, transaction *sqlx.Tx) error {
+	enableValue := int64(1)
+	if rawEnable, ok := integration["enable"]; ok {
+		switch val := rawEnable.(type) {
+		case bool:
+			if val {
+				enableValue = 1
+			} else {
+				enableValue = 0
+			}
+		case int64:
+			enableValue = val
+		case int:
+			enableValue = int64(val)
+		case string:
+			if strings.EqualFold(val, "true") {
+				enableValue = 1
+				break
+			}
+			if strings.EqualFold(val, "false") || val == "" {
+				enableValue = 0
+				break
+			}
+			parsed, err := strconv.ParseInt(val, 10, 32)
+			if err != nil {
+				return err
+			}
+			enableValue = parsed
+		}
+	}
+
+	integrationRuntime, err := integrationFromRow(integration, enableValue == 1)
+	if err != nil {
+		log.Warnf("Failed to refresh integration operation mappings from invalid row: %v", err)
+		return err
+	}
+	if !integrationRuntime.Enable {
+		log.Infof("Removing disabled integration operation mappings provider=[%s]", integrationRuntime.Name)
+		resource.DeleteActionHandlerOnAll(cruds, integrationRuntime.Name)
+		return nil
+	}
+
+	performer, err := NewIntegrationActionPerformer(integrationRuntime, nil, cruds, configStore, transaction)
+	if err != nil {
+		log.Errorf("Failed to create refreshed integration action performer provider=[%s]: %v", integrationRuntime.Name, err)
+		return err
+	}
+	resource.RegisterActionHandlerOnAll(cruds, performer.Name(), performer)
+	log.Printf("Refreshed integration operation mappings for [%s] without restart", integrationRuntime.Name)
+	log.Infof("Refreshed integration operation mappings provider=[%s] crud_maps=%d", integrationRuntime.Name, len(cruds))
+	return nil
+}
+
+func RefreshIntegrationRuntimeByReferenceID(cruds map[string]*resource.DbResource, configStore *resource.ConfigStore, referenceID daptinid.DaptinReferenceId) error {
+	integrationCrud := cruds["integration"]
+	if integrationCrud == nil {
+		return errors.New("integration resource is not available")
+	}
+	transaction, err := integrationCrud.Connection().Beginx()
+	if err != nil {
+		return err
+	}
+	defer transaction.Rollback()
+
+	integration, _, err := integrationCrud.GetSingleRowByReferenceIdWithTransaction("integration", referenceID, nil, transaction)
+	if err != nil {
+		return err
+	}
+	if err := RefreshIntegrationRuntimeFromRow(cruds, configStore, integration, transaction); err != nil {
+		return err
+	}
+	return transaction.Commit()
+}
+
+func PublishIntegrationRuntimeInstallEvent(cruds map[string]*resource.DbResource, referenceID daptinid.DaptinReferenceId, providerName string, requestID string, sourceInstanceID string) error {
+	worldCrud := cruds["world"]
+	if worldCrud == nil || worldCrud.PubSub == nil {
+		return errors.New("PubSub not available")
+	}
+	payload, err := json.Marshal(IntegrationRuntimeInstallMessage{
+		ReferenceID:      referenceID.String(),
+		ProviderName:     providerName,
+		RequestID:        requestID,
+		SourceInstanceID: sourceInstanceID,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = worldCrud.PubSub.Publish(context.Background(), IntegrationRuntimeInstallTopic, string(payload))
+	return err
+}
+
+func StartIntegrationRuntimeInstallSubscriber(ctx context.Context, cruds map[string]*resource.DbResource, configStore *resource.ConfigStore, sourceInstanceID string) *redis.PubSub {
+	worldCrud := cruds["world"]
+	if worldCrud == nil || worldCrud.PubSub == nil {
+		log.Warnf("Integration runtime refresh subscriber not started: PubSub not available")
+		return nil
+	}
+	subscription := worldCrud.PubSub.Subscribe(ctx, IntegrationRuntimeInstallTopic)
+	go func() {
+		channel := subscription.Channel()
+		for msg := range channel {
+			var payload IntegrationRuntimeInstallMessage
+			if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
+				log.Warnf("Ignoring invalid integration runtime refresh message: %v", err)
+				continue
+			}
+			if payload.SourceInstanceID != "" && payload.SourceInstanceID == sourceInstanceID {
+				log.Debugf("Ignoring local integration runtime refresh message provider=[%s] request_id=[%s]", payload.ProviderName, payload.RequestID)
+				continue
+			}
+			referenceID := daptinid.InterfaceToDIR(payload.ReferenceID)
+			if referenceID == daptinid.NullReferenceId {
+				log.Warnf("Ignoring integration runtime refresh with invalid reference_id=[%s] request_id=[%s]", payload.ReferenceID, payload.RequestID)
+				continue
+			}
+			err := RefreshIntegrationRuntimeByReferenceID(cruds, configStore, referenceID)
+			if err != nil {
+				log.Errorf("Failed to refresh integration runtime from cluster message provider=[%s] reference_id=[%s] request_id=[%s]: %v",
+					payload.ProviderName, payload.ReferenceID, payload.RequestID, err)
+				continue
+			}
+			log.Infof("Refreshed integration runtime from cluster message provider=[%s] reference_id=[%s] request_id=[%s]",
+				payload.ProviderName, payload.ReferenceID, payload.RequestID)
+		}
+	}()
+	return subscription
+}
+
+func integrationFromRow(row map[string]interface{}, enable bool) (resource.Integration, error) {
+	name, ok := stringField(row, "name")
+	if !ok {
+		return resource.Integration{}, errors.New("integration name must be a string")
+	}
+	specLanguage, ok := stringField(row, "specification_language")
+	if !ok {
+		return resource.Integration{}, errors.New("integration specification_language must be a string")
+	}
+	specFormat, ok := stringField(row, "specification_format")
+	if !ok {
+		return resource.Integration{}, errors.New("integration specification_format must be a string")
+	}
+	spec, ok := stringField(row, "specification")
+	if !ok {
+		return resource.Integration{}, errors.New("integration specification must be a string")
+	}
+	authType, ok := stringField(row, "authentication_type")
+	if !ok {
+		return resource.Integration{}, errors.New("integration authentication_type must be a string")
+	}
+	authSpec, ok := stringField(row, "authentication_specification")
+	if !ok {
+		return resource.Integration{}, errors.New("integration authentication_specification must be a string")
+	}
+	return resource.Integration{
+		ReferenceId:                 daptinid.InterfaceToDIR(row["reference_id"]),
+		Name:                        name,
+		SpecificationLanguage:       specLanguage,
+		SpecificationFormat:         specFormat,
+		Specification:               spec,
+		AuthenticationType:          authType,
+		AuthenticationSpecification: authSpec,
+		Enable:                      enable,
+	}, nil
+}
+
+func stringField(row map[string]interface{}, key string) (string, bool) {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return "", false
+	}
+	strValue, ok := value.(string)
+	return strValue, ok
+}
+
+// Create a new action performer for becoming administrator action
+func NewIntegrationInstallationPerformer(initConfig *resource.CmsConfig, cruds map[string]*resource.DbResource, configStore *resource.ConfigStore, transaction *sqlx.Tx, instanceID string) (actionresponse.ActionPerformerInterface, error) {
+	handler := integrationInstallationPerformer{
+		cruds:       cruds,
+		configStore: configStore,
+		instanceID:  instanceID,
+	}
+
+	return &handler, nil
+
+}
+
+func GetBodyParameterNamesFromSchemaRef(mode Mode, required bool, schemaRef *openapi3.SchemaRef) ([]string, error) {
+	if schemaRef == nil {
+		if required {
+			return []string{"body"}, nil
+		}
+		return []string{}, nil
+	}
+	if schemaRef.Value == nil {
+		if schemaRef.Ref != "" {
+			return nil, fmt.Errorf("not a valid schema: unresolved schema ref %s", schemaRef.Ref)
+		}
+		if required {
+			return []string{"body"}, nil
+		}
+		return []string{}, nil
+	}
+	return GetBodyParameterNames(mode, "", schemaRef.Value)
+}
+
+func requiredIntegrationBodyParameters(required bool, schemaRef *openapi3.SchemaRef) map[string]bool {
+	requiredNames := make(map[string]bool)
+	if !required || schemaRef == nil || schemaRef.Value == nil {
+		if required && (schemaRef == nil || schemaRef.Value == nil) {
+			requiredNames["body"] = true
+		}
+		return requiredNames
+	}
+	schema := schemaRef.Value
+	if schema.Type != "object" || len(schema.Properties) == 0 {
+		requiredNames["body"] = true
+		return requiredNames
+	}
+	for _, name := range schema.Required {
+		requiredNames[name] = true
+	}
+	return requiredNames
+}
+
+func GetBodyParameterNames(mode Mode, name string, schema *openapi3.Schema) ([]string, error) {
+	if schema == nil {
+		return nil, errors.New("not a valid schema: nil schema")
+	}
+
+	names, err := getBodyParameterNames(mode, name, schema)
+	if err != nil {
+		return nil, err
+	}
+	return uniqueBodyParameterNames(names), nil
+}
+
+func getBodyParameterNames(mode Mode, name string, schema *openapi3.Schema) ([]string, error) {
+	if schema == nil {
+		return nil, errors.New("not a valid schema: nil schema")
+	}
+	if excludeFromMode(mode, schema) {
+		return []string{}, nil
+	}
+
+	var names []string
+	appendCompositionNames := func(schemaRefs openapi3.SchemaRefs, construct string) error {
+		for index, schemaRef := range schemaRefs {
+			if schemaRef == nil || schemaRef.Value == nil {
+				return fmt.Errorf("not a valid schema: %s branch %d is empty", construct, index)
+			}
+			branchNames, err := getBodyParameterNames(mode, name, schemaRef.Value)
+			if err != nil {
+				return fmt.Errorf("%s branch %d: %w", construct, index, err)
+			}
+			names = append(names, branchNames...)
+		}
+		return nil
+	}
+
+	switch {
+	case len(schema.AllOf) > 0:
+		if err := appendCompositionNames(schema.AllOf, "allOf"); err != nil {
+			return nil, err
+		}
+	case len(schema.OneOf) > 0:
+		if err := appendCompositionNames(schema.OneOf, "oneOf"); err != nil {
+			return nil, err
+		}
+	case len(schema.AnyOf) > 0:
+		if err := appendCompositionNames(schema.AnyOf, "anyOf"); err != nil {
+			return nil, err
+		}
+	}
+
+	switch {
+	case schema.Type == "boolean":
+		if name == "" {
+			return append(names, "body"), nil
+		}
+		return names, nil
+	case schema.Type == "number", schema.Type == "integer":
+		if name == "" {
+			return append(names, "body"), nil
+		}
+		return names, nil
+	case schema.Type == "string":
+		if name == "" {
+			return append(names, "body"), nil
+		}
+		return names, nil
+	case schema.Type == "array", schema.Items != nil:
+		if name == "" {
+			names = append(names, "body")
+		}
+
+		return names, nil
+	case schema.Type == "object" && len(schema.Properties) > 0:
+
+		for k, v := range schema.Properties {
+			if excludeFromMode(mode, v.Value) {
+				continue
+			}
+
+			fieldName := joinBodyParameterName(name, k)
+			names = append(names, fieldName)
+
+			childNames, err := getBodyParameterNames(mode, fieldName, v.Value)
+
+			if err != nil {
+				return nil, fmt.Errorf("property %s: %w", fieldName, err)
+			}
+			names = append(names, childNames...)
+		}
+
+		if schema.AdditionalProperties != nil && schema.AdditionalProperties.Value != nil {
+			addl := schema.AdditionalProperties.Value
+
+			if !excludeFromMode(mode, addl) {
+				childNames, err := getBodyParameterNames(mode, name, addl)
+				if err != nil {
+					return nil, fmt.Errorf("can't get example for additional properties")
+				} else {
+					names = append(names, childNames...)
+				}
+			}
+		}
+
+		return names, nil
+	case schema.Type == "object":
+		if name == "" {
+			return append(names, "body"), nil
+		}
+		return names, nil
+	}
+
+	if len(names) > 0 {
+		return names, nil
+	}
+	if name == "" {
+		return []string{"body"}, nil
+	}
+
+	return names, nil
+}
+
+func joinBodyParameterName(prefix string, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "." + name
+}
+
+func uniqueBodyParameterNames(names []string) []string {
+	seen := make(map[string]bool, len(names))
+	unique := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		unique = append(unique, name)
+	}
+	return unique
+}

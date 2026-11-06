@@ -1,0 +1,332 @@
+package llm
+
+import (
+	"bytes"
+	"context"
+	stdjson "encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/buraksezer/olric"
+	"github.com/daptin/daptin/server/auth"
+	daptinid "github.com/daptin/daptin/server/id"
+	"github.com/daptin/daptin/server/resource"
+	gateway "github.com/daptin/llmgateway"
+	"github.com/daptin/llmgateway/adapter"
+	"github.com/daptin/llmgateway/adapter/openaicompat"
+	"github.com/daptin/llmgateway/catalog"
+	"github.com/daptin/llmgateway/contract"
+	"github.com/daptin/llmgateway/guardrail"
+	"github.com/daptin/llmgateway/protocol/openai"
+	"github.com/go-redis/redis/v8"
+	log "github.com/sirupsen/logrus"
+)
+
+type Gateway struct {
+	engine             *gateway.Engine
+	handler            http.Handler
+	metering           daptinMetering
+	batchProcessor     *daptinBatchProcessor
+	maintenanceCancel  context.CancelFunc
+	batchCancel        context.CancelFunc
+	maintenanceDone    chan struct{}
+	batchDone          chan struct{}
+	reloadSubscription *redis.PubSub
+	drainOnce          sync.Once
+	drainErr           error
+}
+
+func NewGateway(ctx context.Context, cruds map[string]*resource.DbResource, olricClient *olric.ClusterClient) (*Gateway, error) {
+	if ctx == nil {
+		return nil, errors.New("LLM gateway requires a lifecycle context")
+	}
+	if olricClient == nil {
+		return nil, errors.New("LLM gateway requires Daptin's Olric client")
+	}
+	counters, err := olricClient.NewDMap("llmgateway-counters")
+	if err != nil {
+		return nil, fmt.Errorf("create LLM gateway counter map: %w", err)
+	}
+	leases, err := olricClient.NewDMap("llmgateway-leases")
+	if err != nil {
+		return nil, fmt.Errorf("create LLM gateway lease map: %w", err)
+	}
+	cache, err := olricClient.NewDMap("llmgateway-cache")
+	if err != nil {
+		return nil, fmt.Errorf("create LLM gateway cache map: %w", err)
+	}
+	coordination := olricCounterStore{values: counters, leases: leases}
+
+	adapters := adapter.NewRegistry()
+	compatible := openaicompat.Factory{}
+	for _, providerType := range []string{"openai-compatible", "openai", "openrouter", "lilac", "google"} {
+		if err := adapters.Register(providerType, compatible); err != nil {
+			return nil, err
+		}
+	}
+	metering := daptinMetering{cruds: cruds, service: resource.NewMeteringService(&cruds)}
+	engine, err := gateway.New(gateway.Dependencies{
+		Catalog: &daptinCatalog{cruds: cruds}, Secrets: daptinSecrets{cruds: cruds}, Adapters: adapters,
+		Authorizer: daptinAuthorizer{cruds: cruds}, Metering: metering,
+		Counters: coordination, Cache: olricResponseCache{values: cache},
+		Guardrails: guardrail.NewRegistry(), Telemetry: daptinTelemetry{}, Selector: gateway.RandomSelector{}, Clock: gateway.SystemClock{},
+	}, gateway.Options{})
+	if err != nil {
+		return nil, err
+	}
+	files := daptinFiles{cruds: cruds}
+	handler, err := engine.Handler(gateway.HTTPOptions{Authenticator: daptinAuthenticator{}, Protocol: openai.Options{
+		Files: files, Batches: daptinBatches{cruds: cruds, files: files},
+	}})
+	if err != nil {
+		return nil, err
+	}
+	if err := engine.Reload(ctx); err != nil {
+		return nil, fmt.Errorf("load LLM gateway catalog: %w", err)
+	}
+	handler = metering.captureHandler(handler)
+	gatewayHost := &Gateway{engine: engine, handler: handler, metering: metering, batchProcessor: &daptinBatchProcessor{
+		cruds: cruds, files: files, batches: daptinBatches{cruds: cruds, files: files}, handler: handler, coordination: coordination,
+	}}
+	gatewayHost.startMaintenance(ctx, cruds["world"].PubSub)
+	return gatewayHost, nil
+}
+
+func (gatewayHost *Gateway) StartBatchProcessing(ctx context.Context) {
+	gatewayHost.batchDone = make(chan struct{})
+	batchContext, cancel := context.WithCancel(ctx)
+	gatewayHost.batchCancel = cancel
+	go func() {
+		defer close(gatewayHost.batchDone)
+		gatewayHost.batchProcessor.Run(batchContext)
+	}()
+}
+
+func (gatewayHost *Gateway) Handler() http.Handler {
+	return gatewayHost.handler
+}
+
+func (gatewayHost *Gateway) Invoke(ctx context.Context, user *auth.SessionUser, request contract.Request) (contract.Response, error) {
+	if user == nil {
+		user = &auth.SessionUser{}
+	}
+	ctx = context.WithValue(ctx, "user", user)
+	requestBody, err := stdjson.Marshal(request)
+	if err != nil {
+		return contract.Response{}, err
+	}
+	payload := &meteringPayload{
+		requestBody:  bytes.NewBuffer(append([]byte(nil), requestBody[:min(len(requestBody), resource.MeteringPayloadBodyLimit)]...)),
+		requestBytes: len(requestBody),
+	}
+	ctx = context.WithValue(ctx, meteringPayloadKey{}, payload)
+	response, err := gatewayHost.engine.Invoke(ctx, gatewayPrincipal(user), request)
+	responseBody, marshalErr := stdjson.Marshal(response)
+	if err != nil {
+		responseBody, marshalErr = stdjson.Marshal(map[string]string{"error": err.Error()})
+	}
+	if marshalErr == nil {
+		if recordErr := gatewayHost.metering.recordResponse(ctx, payload,
+			responseBody[:min(len(responseBody), resource.MeteringPayloadBodyLimit)], len(responseBody)); recordErr != nil {
+			log.Errorf("record LLM response payload: %v", recordErr)
+		}
+	}
+	return response, err
+}
+
+type meteringReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+type meteringResponseWriter struct {
+	http.ResponseWriter
+	body  bytes.Buffer
+	bytes int
+}
+
+func (writer *meteringResponseWriter) Write(body []byte) (int, error) {
+	n, err := writer.ResponseWriter.Write(body)
+	writer.bytes += n
+	if remaining := resource.MeteringPayloadBodyLimit - writer.body.Len(); remaining > 0 {
+		writer.body.Write(body[:min(n, remaining)])
+	}
+	return n, err
+}
+
+func (writer *meteringResponseWriter) Flush() {
+	if flusher, ok := writer.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (writer *meteringResponseWriter) Unwrap() http.ResponseWriter {
+	return writer.ResponseWriter
+}
+
+func (metering daptinMetering) captureHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || strings.HasPrefix(request.URL.Path, "/v1/files") ||
+			strings.HasPrefix(request.URL.Path, "/v1/batches") {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		payload := &meteringPayload{requestBody: &bytes.Buffer{}}
+		if request.Body != nil {
+			request.Body = meteringReadCloser{Reader: io.TeeReader(request.Body, payload), Closer: request.Body}
+		}
+		request = request.WithContext(context.WithValue(request.Context(), meteringPayloadKey{}, payload))
+		responseWriter := &meteringResponseWriter{ResponseWriter: writer}
+		next.ServeHTTP(responseWriter, request)
+		if err := metering.recordResponse(request.Context(), payload, responseWriter.body.Bytes(), responseWriter.bytes); err != nil {
+			log.Errorf("record LLM response payload: %v", err)
+		}
+	})
+}
+
+func (gatewayHost *Gateway) Reload(ctx context.Context) error {
+	return gatewayHost.engine.Reload(ctx)
+}
+
+func (gatewayHost *Gateway) Status() gateway.Status {
+	return gatewayHost.engine.Status()
+}
+
+func (gatewayHost *Gateway) Drain(ctx context.Context) error {
+	gatewayHost.drainOnce.Do(func() {
+		if gatewayHost.maintenanceCancel != nil {
+			gatewayHost.maintenanceCancel()
+		}
+		if gatewayHost.batchCancel != nil {
+			gatewayHost.batchCancel()
+		}
+		if gatewayHost.reloadSubscription != nil {
+			gatewayHost.drainErr = gatewayHost.reloadSubscription.Close()
+		}
+	})
+	err := gatewayHost.drainErr
+	if gatewayHost.maintenanceDone != nil {
+		select {
+		case <-gatewayHost.maintenanceDone:
+		case <-ctx.Done():
+			err = errors.Join(err, ctx.Err())
+		}
+	}
+	if gatewayHost.batchDone != nil {
+		select {
+		case <-gatewayHost.batchDone:
+		case <-ctx.Done():
+			err = errors.Join(err, ctx.Err())
+		}
+	}
+	return errors.Join(err, gatewayHost.engine.Drain(ctx))
+}
+
+func (gatewayHost *Gateway) startMaintenance(parent context.Context, pubsub *olric.PubSub) {
+	ctx, cancel := context.WithCancel(parent)
+	gatewayHost.maintenanceCancel = cancel
+	gatewayHost.maintenanceDone = make(chan struct{})
+	var events <-chan *redis.Message
+	if pubsub != nil {
+		gatewayHost.reloadSubscription = pubsub.Subscribe(ctx, "credential", "llm_provider", "llm_model", "llm_deployment")
+		events = gatewayHost.reloadSubscription.Channel()
+	}
+	go func() {
+		defer close(gatewayHost.maintenanceDone)
+		poll := time.NewTicker(3 * time.Second)
+		defer poll.Stop()
+		health := time.NewTicker(time.Second)
+		defer health.Stop()
+		probeFinished := make(chan struct{}, 1)
+		probeActive := false
+		debounce := time.NewTimer(time.Hour)
+		if !debounce.Stop() {
+			<-debounce.C
+		}
+		defer debounce.Stop()
+		var debounceChannel <-chan time.Time
+		reload := func() {
+			reloadContext, reloadCancel := context.WithTimeout(ctx, 30*time.Second)
+			err := gatewayHost.Reload(reloadContext)
+			reloadCancel()
+			if err != nil && !errors.Is(err, catalog.ErrStaleRevision) && !errors.Is(err, context.Canceled) {
+				log.WithError(err).Error("[llm] catalog reload rejected; retaining active snapshot")
+			}
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, open := <-events:
+				if !open {
+					events = nil
+					continue
+				}
+				if !debounce.Stop() && debounceChannel != nil {
+					select {
+					case <-debounce.C:
+					default:
+					}
+				}
+				debounce.Reset(250 * time.Millisecond)
+				debounceChannel = debounce.C
+			case <-debounceChannel:
+				debounceChannel = nil
+				reload()
+			case <-poll.C:
+				reload()
+			case <-health.C:
+				if probeActive {
+					continue
+				}
+				probeActive = true
+				go func() {
+					_, _ = gatewayHost.engine.Probe(ctx)
+					probeFinished <- struct{}{}
+				}()
+			case <-probeFinished:
+				probeActive = false
+			}
+		}
+	}()
+}
+
+type daptinAuthenticator struct{}
+
+func (daptinAuthenticator) Authenticate(ctx context.Context, _ string) (contract.Principal, error) {
+	return gatewayPrincipal(daptinSessionUser(ctx)), nil
+}
+
+func gatewayPrincipal(user *auth.SessionUser) contract.Principal {
+	owner := contract.ID("")
+	if user.UserReferenceId != daptinid.NullReferenceId {
+		owner = contract.ID(user.UserReferenceId.String())
+	}
+	groups := make([]contract.ID, 0, len(user.Groups))
+	for _, group := range user.Groups {
+		if group.GroupReferenceId != daptinid.NullReferenceId {
+			groups = append(groups, contract.ID(group.GroupReferenceId.String()))
+		}
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i] < groups[j] })
+	return contract.Principal{KeyID: owner, OwnerID: owner, GroupIDs: groups}
+}
+
+type daptinTelemetry struct{}
+
+func (daptinTelemetry) Record(_ context.Context, event gateway.TelemetryEvent) {
+	fields := log.Fields{"event": event.Name, "request_id": event.RequestID, "revision": event.Revision}
+	for key, value := range event.Attributes {
+		fields[key] = value
+	}
+	for key, value := range event.Measures {
+		fields[key] = value
+	}
+	log.WithFields(fields).Debug("LLM gateway event")
+}

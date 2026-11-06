@@ -1,0 +1,265 @@
+# Column Types
+
+Daptin supports **41 built-in column types** for automatic validation, storage, and API type mapping.
+
+**Related**: [[Core-Concepts|Core Concepts]] | [[Column-Type-Reference|Column Type Reference]] | [[Schema-Definition|Schema Definition]]
+
+**Tested:** 2026-01-25
+
+---
+
+## Choosing the Right Column Type
+
+Start here if you're unsure which type to use:
+
+| If you need... | Use this type | Why |
+|----------------|---------------|-----|
+| Product name, title | `label` | Short text, single line, good for display |
+| Blog post, description | `content` | Long text, multi-line, unlimited length |
+| User email | `email` | Built-in validation, auto-lowercase |
+| Yes/no flag, checkbox | `truefalse` | Boolean values |
+| Price, quantity, count | `measurement` | Integer numbers |
+| Price with cents | `float` | Decimal precision (19.99) |
+| Profile photo, logo | `file` with cloud_store | Efficient storage, CDN-ready |
+| Small icon (< 100KB) | `file` inline | Base64 encoding, no extra setup |
+| Password | `bcrypt` | Secure hashing automatically |
+| Secret API key | `encrypted` | AES encryption at rest |
+| Date only | `date` | ISO format (2026-01-25) |
+| Date and time | `datetime` | Full timestamp with timezone |
+| GPS coordinates | `location.latitude`, `location.longitude` | Decimal degrees with validation |
+| Star rating (1-10) | `rating` | 0-10 range validation |
+| Hex color code | `color` | #RRGGBB format validation |
+| Dropdown select | `enum` | Restricted value list (use with Options) |
+| JSON data | `json` | Objects/arrays as text |
+| Unique identifier | `alias` | URL-safe slugs, SKUs |
+| Website URL | `url` | URL format validation |
+
+**Pro tip:** Start with `label` for most text, `content` for long text, and `measurement` for numbers. Refine as needed.
+
+---
+
+## Basic Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `label` | varchar(500) | Short text, single line |
+| `name` | varchar(200) | Name field |
+| `text` | varchar(1000) | Medium text |
+| `textarea` | text | Long text, multiline |
+| `content` | text | Rich content |
+| `hidden` | varchar(500) | Hidden field |
+
+## Numeric Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `measurement` | float(8) | Numeric measurement |
+| `decimal` | double | Decimal number |
+| `percent` | float(8) | Percentage (0-100) |
+| `rating5` | int(11) | Rating 1-5 |
+| `rating10` | int(11) | Rating 1-10 |
+| `rating100` | int(11) | Rating 1-100 |
+
+## Boolean Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `truefalse` | bool | True/false toggle |
+
+## Date/Time Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `datetime` | datetime | Full date and time |
+| `date` | date | Date only |
+| `time` | time | Time only |
+| `day` | int(11) | Day of month (1-31) |
+| `month` | int(11) | Month (1-12) |
+| `year` | int(11) | Year |
+| `timestamp` | timestamp | Unix timestamp |
+
+## Identity Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `email` | varchar(200) | Email address |
+| `url` | varchar(500) | Web URL |
+| `image` | blob | Image extension and matching declared MIME type required |
+| `id` | varchar(40) | UUID reference |
+| `alias` | varchar(200) | URL-safe slug |
+
+## Security Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `password` | varchar(200) | Hashed password |
+| `bcrypt` | varchar(200) | Bcrypt hash |
+| `encrypted` | text | AES encrypted |
+
+## Geographic Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `location` | varchar(100) | Lat/long coordinates |
+| `location.latitude` | float(8) | Latitude |
+| `location.longitude` | float(8) | Longitude |
+
+## File Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `file.*` | text | File column with a wildcard suffix |
+| `file.jpg|jpeg|png|gif` | text | File column with image-related suffixes |
+| `file.mp4|webm` | text | File column with video-related suffixes |
+| `file.mp3|wav` | text | File column with audio-related suffixes |
+| `file.pdf|doc|docx` | text | File column with document-related suffixes |
+| `file.csv|xls|xlsx` | text | File column with spreadsheet-related suffixes |
+| `file.pdf` | text | File column with a `pdf` suffix |
+
+These suffixes restrict uploaded filenames and require a declared MIME type.
+Daptin checks the MIME type against known extensions but does not inspect file
+contents to verify their format. See [Asset Columns](Asset-Columns.md).
+
+File columns support:
+- Base64 encoding
+- Cloud storage sync
+- YJS collaborative editing
+- Presigned URL generation
+
+## Data Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `json` | text | JSON object |
+| `markdown` | text | Markdown content |
+| `html` | text | HTML content |
+
+## Selection Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `enum` | varchar(100) | Enumerated values |
+| `select` | varchar(100) | Single select |
+| `multiselect` | text | Multiple select (JSON) |
+
+### Enum Configuration
+
+```yaml
+Columns:
+  - Name: status
+    DataType: varchar(50)
+    ColumnType: enum
+    Values:
+      - draft
+      - published
+      - archived
+```
+
+## Color Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `color` | varchar(20) | Hex color (#RRGGBB) |
+
+## Network Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `ipaddress` | varchar(50) | IPv4/IPv6 address |
+
+## Special Types
+
+| ColumnType | DataType | Description |
+|------------|----------|-------------|
+| `uuid` | varchar(40) | UUID v7 |
+| `namespace` | varchar(200) | Namespace path |
+
+## Type Detection
+
+When importing data, Daptin automatically detects types:
+
+```go
+// Detection priority
+1. UUID pattern -> id
+2. Email pattern -> email
+3. URL pattern -> url
+4. DateTime pattern -> datetime
+5. Date pattern -> date
+6. Time pattern -> time
+7. Boolean -> truefalse
+8. Integer -> measurement
+9. Float -> decimal
+10. JSON -> json
+11. Default -> label
+```
+
+## Column Definition Example
+
+```yaml
+Columns:
+  # Text
+  - Name: title
+    DataType: varchar(500)
+    ColumnType: label
+    IsNullable: false
+
+  # Numeric
+  - Name: price
+    DataType: float(8)
+    ColumnType: measurement
+
+  # Boolean
+  - Name: active
+    DataType: bool
+    ColumnType: truefalse
+    DefaultValue: "true"
+
+  # DateTime
+  - Name: published_at
+    DataType: datetime
+    ColumnType: datetime
+
+  # Email
+  - Name: contact_email
+    DataType: varchar(200)
+    ColumnType: email
+
+  # File
+  - Name: attachment
+    DataType: text
+    ColumnType: file.pdf|doc|docx
+
+  # JSON
+  - Name: metadata
+    DataType: text
+    ColumnType: json
+
+  # Enum
+  - Name: status
+    DataType: varchar(50)
+    ColumnType: enum
+    Values: ["draft", "review", "published"]
+
+  # Location
+  - Name: coordinates
+    DataType: varchar(100)
+    ColumnType: location
+
+  # Encrypted
+  - Name: secret_data
+    DataType: text
+    ColumnType: encrypted
+```
+
+## Validation
+
+Types include automatic validation:
+
+| Type | Validation |
+|------|------------|
+| `email` | RFC 5322 email format |
+| `url` | Valid URL format |
+| `datetime` | ISO 8601 format |
+| `json` | Valid JSON |
+| `rating5` | Range 1-5 |
+| `percent` | Range 0-100 |
