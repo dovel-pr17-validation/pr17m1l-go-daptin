@@ -47,12 +47,12 @@ require (
 	github.com/ghodss/yaml v1.0.0
 	github.com/gin-contrib/gzip v0.0.6
 	github.com/gin-gonic/gin v1.10.0
-	github.com/go-acme/lego/v3 v3.2.0
+	github.com/go-acme/lego/v3 v3.9.0
 	github.com/go-gota/gota v0.0.0-20190402185630-1058f871be31
 	github.com/go-playground/locales v0.14.1
 	github.com/go-playground/universal-translator v0.18.1
 	github.com/go-redis/redis/v8 v8.11.5
-	github.com/go-sql-driver/mysql v1.6.0
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/gobuffalo/flect v0.3.0
 	github.com/gocarina/gocsv v0.0.0-20240520201108-78e41c74b4b1
 	github.com/gocraft/health v0.0.0-20170925182251-8675af27fef0
@@ -83,6 +83,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.25.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.9.1
+	github.com/teambition/rrule-go v1.8.2
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.38.0
 	golang.org/x/oauth2 v0.36.0
@@ -101,6 +102,7 @@ require (
 	cloud.google.com/go/compute/metadata v0.6.0 // indirect
 	cloud.google.com/go/iam v1.1.13 // indirect
 	cloud.google.com/go/storage v1.43.0 // indirect
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Azure/azure-pipeline-go v0.2.3 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.17.1 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.8.2 // indirect
@@ -174,7 +176,7 @@ require (
 	github.com/bytedance/sonic v1.13.2 // indirect
 	github.com/bytedance/sonic/loader v0.2.4 // indirect
 	github.com/calebcase/tmpfile v1.0.3 // indirect
-	github.com/cenkalti/backoff/v3 v3.0.0 // indirect
+	github.com/cenkalti/backoff/v4 v4.1.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/chilts/sid v0.0.0-20190607042430-660e94789ec9 // indirect
 	github.com/clbanning/mxj/v2 v2.5.7 // indirect
@@ -356,7 +358,6 @@ require (
 	github.com/t3rm1n4l/go-mega v0.0.0-20241213151442-a19cff0ec7b5 // indirect
 	github.com/tdewolff/minify/v2 v2.12.9 // indirect
 	github.com/tdewolff/parse/v2 v2.6.8 // indirect
-	github.com/teambition/rrule-go v1.8.2 // indirect
 	github.com/tidwall/btree v1.7.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/redcon v1.6.2 // indirect
