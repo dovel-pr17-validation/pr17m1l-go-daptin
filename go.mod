@@ -7,7 +7,7 @@ go 1.25.0
 require (
 	github.com/GeertJohan/go.rice v1.0.3
 	github.com/advance512/yaml v0.0.0-20141213031416-e401b2b02685
-	github.com/alexeyco/simpletable v0.0.0-20180729223640-1fa9009f1080
+	github.com/alexeyco/simpletable v1.0.0
 	github.com/anthonynsimon/bild v0.10.0
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de
 	github.com/artpar/api2go-adapter v1.0.2
@@ -83,6 +83,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.25.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.9.1
+	github.com/teambition/rrule-go v1.8.2
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.38.0
 	golang.org/x/oauth2 v0.36.0
@@ -356,7 +357,6 @@ require (
 	github.com/t3rm1n4l/go-mega v0.0.0-20241213151442-a19cff0ec7b5 // indirect
 	github.com/tdewolff/minify/v2 v2.12.9 // indirect
 	github.com/tdewolff/parse/v2 v2.6.8 // indirect
-	github.com/teambition/rrule-go v1.8.2 // indirect
 	github.com/tidwall/btree v1.7.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/redcon v1.6.2 // indirect
